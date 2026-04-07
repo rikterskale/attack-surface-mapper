@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import importlib.util
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +90,84 @@ class ParserTests(unittest.TestCase):
      with patch.object(asm.shutil, "which", return_value="/usr/bin/theHarvester") as which_mock:
         self.assertTrue(tool.is_installed())
         which_mock.assert_called_once_with("theHarvester")
+
+class CLIMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_main_exits_on_invalid_cli_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scope = Path(tmpdir) / "scope.json"
+            targets = ["example.com"]
+            payload = json.dumps({"allowed_targets": targets}, sort_keys=True).encode()
+            signature = hmac.new(b"secret123", payload, hashlib.sha256).hexdigest()
+            scope.write_text(json.dumps({"allowed_targets": targets, "signature": signature}), encoding="utf-8")
+
+            args = [
+                "attack-surface-mapper.py",
+                "bad target",
+                "--scope-file", str(scope),
+                "--scope-secret", "secret123",
+                "--output-dir", str(Path(tmpdir) / "out"),
+            ]
+
+            with patch.object(sys, "argv", args), \
+                 patch.object(asm.ScopeValidator, "runtime_acknowledgement", return_value=None):
+                with self.assertRaises(SystemExit) as ctx:
+                    await asm.main()
+                self.assertEqual(ctx.exception.code, 1)
+
+    async def test_main_exits_on_missing_targets_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scope = Path(tmpdir) / "scope.json"
+            targets = ["example.com"]
+            payload = json.dumps({"allowed_targets": targets}, sort_keys=True).encode()
+            signature = hmac.new(b"secret123", payload, hashlib.sha256).hexdigest()
+            scope.write_text(json.dumps({"allowed_targets": targets, "signature": signature}), encoding="utf-8")
+
+            missing_file = Path(tmpdir) / "does-not-exist.txt"
+            args = [
+                "attack-surface-mapper.py",
+                "--file", str(missing_file),
+                "--scope-file", str(scope),
+                "--scope-secret", "secret123",
+                "--output-dir", str(Path(tmpdir) / "out"),
+            ]
+
+            with patch.object(sys, "argv", args), \
+                 patch.object(asm.ScopeValidator, "runtime_acknowledgement", return_value=None):
+                with self.assertRaises(SystemExit) as ctx:
+                    await asm.main()
+                self.assertEqual(ctx.exception.code, 1)
+
+
+class ExportTests(unittest.TestCase):
+    def test_export_results_writes_jsonl_and_csv(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir)
+            db = asm.SQLiteDB(out / "findings.db")
+
+            finding = asm.Finding(
+                tool="nmap",
+                asset="10.0.0.1",
+                indicator="open_tcp_443",
+                value="open tcp/443 service=https",
+                type="open_port",
+            )
+            db.add_finding(finding.model_dump())
+
+            asm.export_results(db, out)
+            db.close()
+
+            jsonl = out / "findings.jsonl"
+            csvf = out / "findings.csv"
+
+            self.assertTrue(jsonl.exists())
+            self.assertTrue(csvf.exists())
+
+            json_lines = jsonl.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(json_lines), 1)
+
+            csv_lines = csvf.read_text(encoding="utf-8").strip().splitlines()
+            self.assertGreaterEqual(len(csv_lines), 2)  # header + row
+            self.assertIn("open_tcp_443", csv_lines[1])
         
 class AsyncRunTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_recon_marks_partial_on_tool_exception(self):
