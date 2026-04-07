@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Safe Standalone Recon Agent - Enterprise Edition (v3.4)
+Safe Standalone Recon Agent - Enterprise Edition (v3.4.0)
 
 Signed-scope recon orchestrator that enforces HMAC-verified scope files
 and runtime operator acknowledgement before executing third-party
@@ -11,9 +11,6 @@ import argparse
 import asyncio
 import atexit
 import csv
-import hashlib
-import hmac
-import ipaddress
 import json
 import os
 import platform
@@ -24,19 +21,32 @@ import subprocess
 import sys
 import time
 import uuid
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import structlog
+from defusedxml.ElementTree import fromstring as safe_xml_fromstring
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from pydantic import BaseModel, Field
+
+from scope_utils import (
+    MIN_SECRET_LENGTH,
+    canonicalize_targets,
+    compute_signature,
+    parse_and_canonicalize_target,
+    parse_targets_from_lines,
+    update_and_resign,
+    validate_scope_schema,
+    validate_secret,
+    verify_signed_scope,
+)
+
+__version__ = "3.4.0"
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -119,6 +129,23 @@ logger = structlog.get_logger("recon_agent")
 trace.set_tracer_provider(TracerProvider())
 _tracer_provider = trace.get_tracer_provider()
 tracer = trace.get_tracer(__name__)
+
+# Span file handle — registered with atexit for clean shutdown (fix #9).
+_SPAN_FILE_HANDLE = None
+
+
+def _cleanup_span_handle():
+    """Close the span file handle on interpreter shutdown."""
+    global _SPAN_FILE_HANDLE
+    if _SPAN_FILE_HANDLE:
+        try:
+            _SPAN_FILE_HANDLE.close()
+        except Exception:
+            pass
+        _SPAN_FILE_HANDLE = None
+
+
+atexit.register(_cleanup_span_handle)
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -213,7 +240,15 @@ class PolicyEngine:
         if tools_file.exists():
             try:
                 data = json.loads(tools_file.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and all(isinstance(v, list) for v in data.values()):
+                if (
+                    isinstance(data, dict)
+                    and all(isinstance(v, list) for v in data.values())
+                    and all(
+                        isinstance(item, str)
+                        for v in data.values()
+                        for item in v
+                    )
+                ):
                     logger.info("external_tools_loaded", path=str(tools_file))
                     return data
                 logger.warning("external_tools_invalid_schema", path=str(tools_file))
@@ -226,103 +261,23 @@ class PolicyEngine:
 
 
 # ---------------------------------------------------------------------------
-# Scope validation
+# Scope validation (delegates to scope_utils)
 # ---------------------------------------------------------------------------
 
 
-def parse_and_canonicalize_target(target: str) -> str:
-    """Normalize a user-supplied target string to a canonical lowercase form.
-
-    Strips schemes, ports, paths, and validates as an IP, CIDR, or domain.
-    """
-    target = target.strip().lower()
-    if "://" in target:
-        parsed = urlparse(target)
-        target = parsed.netloc or parsed.path
-    target = target.rstrip("/").split("/", 1)[0]
-    if ":" in target and not target.startswith("["):
-        host, port = target.rsplit(":", 1)
-        if port.isdigit():
-            target = host
-
-    try:
-        ipaddress.ip_address(target)
-        return target
-    except ValueError:
-        pass
-
-    try:
-        ipaddress.ip_network(target, strict=False)
-        return target
-    except ValueError:
-        pass
-
-    domain_regex = r"^(?=.{1,253}$)(?:(?!-)[a-z0-9-]{1,63}(?<!-)\.)+[a-z]{2,63}$"
-    if re.match(domain_regex, target):
-        return target
-    raise ValueError(f"Invalid target format: {target}")
-
-
-def _canonicalize_targets(targets: List[str]) -> List[str]:
-    """Return a sorted, deduplicated, canonicalized copy of *targets*.
-
-    Invalid entries are silently dropped.  Callers that need diagnostics
-    should use :func:`parse_targets_from_lines` instead.
-    """
-    canonical: List[str] = []
-    for t in targets:
-        try:
-            canonical.append(parse_and_canonicalize_target(t))
-        except ValueError:
-            pass
-    return sorted(set(canonical))
-
-
 class ScopeValidator:
-    """Manages HMAC-signed scope files and runtime acknowledgement."""
+    """Manages HMAC-signed scope files and runtime acknowledgement.
 
-    @staticmethod
-    def _validate_scope_schema(data: Dict[str, Any]) -> List[str]:
-        """Validate the shape of a scope dict and return the target list."""
-        targets = data.get("allowed_targets")
-        signature = data.get("signature")
+    All cryptographic and canonicalization logic lives in ``scope_utils``.
+    This class provides the interface used by the rest of the scanner.
+    """
 
-        if not isinstance(targets, list):
-            raise ValueError("Scope file must contain 'allowed_targets' as a list")
-        if not all(isinstance(t, str) for t in targets):
-            raise ValueError("All entries in 'allowed_targets' must be strings")
-        if not isinstance(signature, str) or not signature.strip():
-            raise ValueError("Scope file missing signature")
-        return targets
-
-    @staticmethod
-    def _compute_signature(targets: List[str], secret: str) -> str:
-        """Compute HMAC-SHA256 over canonicalized, sorted targets."""
-        canonical = _canonicalize_targets(targets)
-        payload = json.dumps({"allowed_targets": canonical}, sort_keys=True).encode()
-        return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+    _compute_signature = staticmethod(compute_signature)
 
     @staticmethod
     def verify_signed_scope(scope_file: str, secret: str) -> List[str]:
-        """Verify the HMAC signature of *scope_file* and return allowed targets.
-
-        Targets are canonicalized before signature comparison so that case
-        differences between the file and the running scan do not cause
-        silent mismatches.
-        """
-        path = Path(scope_file)
-        if not path.exists():
-            raise FileNotFoundError(f"Scope file {scope_file} not found")
-
-        data = json.loads(path.read_text(encoding="utf-8"))
-        targets = ScopeValidator._validate_scope_schema(data)
-        signature = data["signature"]
-
-        expected = ScopeValidator._compute_signature(targets, secret)
-
-        if not hmac.compare_digest(expected, signature):
-            raise ValueError("Invalid scope signature - authorization denied")
-
+        """Verify the HMAC signature of *scope_file* and return allowed targets."""
+        targets = verify_signed_scope(scope_file, secret)
         logger.info("scope_verified", targets_count=len(targets))
         return targets
 
@@ -330,27 +285,9 @@ class ScopeValidator:
     def update_and_resign(scope_file: str, new_targets: List[str], secret: str):
         """Merge *new_targets* into the scope file, canonicalize, and re-sign."""
         logger.info("scope_update_starting", scope_file=scope_file, new_targets_provided=len(new_targets))
-
-        path = Path(scope_file)
         try:
-            if path.exists():
-                data = json.loads(path.read_text(encoding="utf-8"))
-                existing = set(ScopeValidator._validate_scope_schema(data))
-            else:
-                existing = set()
-
-            merged = _canonicalize_targets(list(existing) + new_targets)
-            signature = ScopeValidator._compute_signature(merged, secret)
-
-            updated = {"allowed_targets": merged, "signature": signature}
-            path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
-
-            logger.info(
-                "scope_update_success",
-                new_targets_added=len(merged) - len(existing),
-                total_targets=len(merged),
-                scope_file=scope_file,
-            )
+            update_and_resign(scope_file, new_targets, secret)
+            logger.info("scope_update_success", scope_file=scope_file)
         except Exception as e:
             logger.exception(
                 "scope_update_failed",
@@ -382,20 +319,6 @@ def sanitize_filename_fragment(value: str) -> str:
     """Produce a filesystem-safe fragment from an arbitrary string."""
     sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", value.strip())
     return sanitized or "unknown_target"
-
-
-def parse_targets_from_lines(lines: List[str]) -> Tuple[List[str], List[str]]:
-    """Split raw text lines into (valid_targets, invalid_targets)."""
-    valid_targets: List[str] = []
-    invalid_targets: List[str] = []
-    for line in lines:
-        if not line.strip():
-            continue
-        try:
-            valid_targets.append(parse_and_canonicalize_target(line))
-        except ValueError:
-            invalid_targets.append(line.strip())
-    return valid_targets, invalid_targets
 
 
 # ---------------------------------------------------------------------------
@@ -627,14 +550,11 @@ class Tool:
         return findings
 
     def _parse_nmap_xml(self, output: str, target: str) -> List[Finding]:
+        """Parse nmap XML output using defusedxml (required dependency)."""
         findings: List[Finding] = []
         try:
-            try:
-                from defusedxml.ElementTree import fromstring as safe_fromstring
-                root = safe_fromstring(output)
-            except ImportError:
-                root = ET.fromstring(output)
-        except ET.ParseError:
+            root = safe_xml_fromstring(output)
+        except Exception:
             return self._parse_generic_lines(output, target)
 
         for host in root.findall("host"):
@@ -904,7 +824,9 @@ def export_results(db: SQLiteDB, output_dir: Path):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Enterprise Recon Agent v3.4")
+    parser = argparse.ArgumentParser(
+        description=f"Enterprise Recon Agent v{__version__}"
+    )
     parser.add_argument("target", nargs="?", help="Single target")
     parser.add_argument("--file", "-f", help="Targets file")
     parser.add_argument("--depth", choices=["passive", "standard", "deep"], default="standard")
@@ -930,21 +852,22 @@ async def main():
     logger = structlog.get_logger("recon_agent")
 
     # Write span traces to a file instead of stdout.
+    global _SPAN_FILE_HANDLE
     try:
         span_log_path = output_dir / "spans.jsonl"
-        _span_fh = open(span_log_path, "a", encoding="utf-8")
+        _SPAN_FILE_HANDLE = open(span_log_path, "a", encoding="utf-8")
 
         class _FileSpanExporter(ConsoleSpanExporter):
             def __init__(self, fh):
                 super().__init__(out=fh)
 
         _tracer_provider.add_span_processor(
-            BatchSpanProcessor(_FileSpanExporter(_span_fh))
+            BatchSpanProcessor(_FileSpanExporter(_SPAN_FILE_HANDLE))
         )
     except Exception as e:
         logger.warning("span_exporter_setup_failed", error=str(e))
 
-    logger.info("recon_started", version="3.4", depth=args.depth)
+    logger.info("recon_started", version=__version__, depth=args.depth)
 
     if args.scope_secret:
         logger.warning("scope_secret_cli_used", message="Prefer RECON_SCOPE_SECRET env var over --scope-secret")
@@ -953,6 +876,14 @@ async def main():
     if not secret:
         logger.error("missing_scope_secret")
         print("\u274c Error: Scope secret is required (set RECON_SCOPE_SECRET; --scope-secret is supported but discouraged)")
+        sys.exit(1)
+
+    # Enforce minimum secret length (fix #5)
+    try:
+        validate_secret(secret)
+    except ValueError as e:
+        logger.error("scope_secret_too_short", error=str(e))
+        print(f"\u274c Error: {e}")
         sys.exit(1)
 
     # ------------------------------------------------------------------

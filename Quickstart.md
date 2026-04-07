@@ -1,4 +1,4 @@
-# Recon Agent Quick Start (v3.4)
+# Recon Agent Quick Start (v3.4.0)
 
 ## 1) Prerequisites
 
@@ -36,7 +36,7 @@ You can also use the one-liner in `one-liner-scope-creation.md`.
 Single target (passive — no direct target interaction):
 
 ```bash
-export RECON_SCOPE_SECRET="your-secret-key"
+export RECON_SCOPE_SECRET="your-secret-min-16-chars"
 python3 attack-surface-mapper.py example.com \
   --scope-file scope.json \
   --depth passive \
@@ -66,8 +66,9 @@ python3 attack-surface-mapper.py example.com \
 ## 5) What the agent enforces
 
 1. **Signed scope verification** — the HMAC signature on `scope.json` is verified before anything else.
-2. **Runtime acknowledgement prompt** — the operator must type an exact confirmation string.
-3. **Target filtering** — only targets present in the verified scope are scanned.
+2. **Minimum secret length** — the secret must be at least 16 characters.
+3. **Runtime acknowledgement prompt** — the operator must type an exact confirmation string.
+4. **Target filtering** — only targets present in the verified scope are scanned.
 
 ## 6) Output structure
 
@@ -89,6 +90,7 @@ Top-level files (`findings.*`, `recon.log`, `spans.jsonl`) live in the output di
 ## 7) Troubleshooting
 
 - **missing_scope_secret**: set `RECON_SCOPE_SECRET` or pass `--scope-secret`.
-- **no_valid_targets_in_scope**: make sure targets are listed in `scope.json` and match your input. Targets are canonicalized (lowercased, schemes/ports stripped) — `Example.com` and `https://example.com:443` both resolve to `example.com`.
+- **scope_secret_too_short**: secret must be at least 16 characters.
+- **no_valid_targets_in_scope**: make sure targets are listed in `scope.json` and match your input. Targets are canonicalized (lowercased, schemes/ports stripped, CIDR preserved) — `Example.com` and `https://example.com:443` both resolve to `example.com`.
 - **Invalid scope signature**: if you edited `scope.json` by hand or changed your secret, re-run `create_scope.py` to regenerate it.
 - **Missing tools**: install binaries manually or use `--auto-install` on Kali. The scanner logs a warning for each missing tool so you can see exactly what was skipped.

@@ -9,16 +9,28 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+# ---------------------------------------------------------------------------
+# Import the main module via importlib (hyphenated filename).
+# Note: this executes module-level code (logging/tracing setup) as a side
+# effect.  Acceptable for a test suite that runs in its own process.
+# ---------------------------------------------------------------------------
+
 MODULE_PATH = Path(__file__).resolve().parents[1] / "attack-surface-mapper.py"
 spec = importlib.util.spec_from_file_location("attack_surface_mapper", MODULE_PATH)
 asm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(asm)
 
+# Import scope_utils directly for utility tests
+SCOPE_UTILS_PATH = Path(__file__).resolve().parents[1] / "scope_utils.py"
+su_spec = importlib.util.spec_from_file_location("scope_utils", SCOPE_UTILS_PATH)
+scope_utils = importlib.util.module_from_spec(su_spec)
+su_spec.loader.exec_module(scope_utils)
+
 
 def _make_scope(targets, secret):
     """Helper: build a scope dict with a valid v3.4 canonicalized signature."""
-    sig = asm.ScopeValidator._compute_signature(targets, secret)
-    canonical = asm._canonicalize_targets(targets)
+    sig = scope_utils.compute_signature(targets, secret)
+    canonical = scope_utils.canonicalize_targets(targets)
     return {"allowed_targets": canonical, "signature": sig}
 
 
@@ -29,116 +41,155 @@ def _write_scope(path, targets, secret):
     return data
 
 
+class ScopeUtilsTests(unittest.TestCase):
+    """Tests for the shared scope_utils module."""
+
+    def test_canonicalize_preserves_cidr(self):
+        """CIDR notation like /24 must be preserved, not stripped."""
+        result = scope_utils.parse_and_canonicalize_target("192.168.1.0/24")
+        self.assertEqual(result, "192.168.1.0/24")
+
+    def test_canonicalize_strips_url_path(self):
+        result = scope_utils.parse_and_canonicalize_target("https://example.com/path/to/thing")
+        self.assertEqual(result, "example.com")
+
+    def test_canonicalize_strips_scheme_and_port(self):
+        result = scope_utils.parse_and_canonicalize_target("https://api.example.com:443/path")
+        self.assertEqual(result, "api.example.com")
+
+    def test_validate_secret_rejects_short(self):
+        with self.assertRaises(ValueError):
+            scope_utils.validate_secret("short")
+
+    def test_validate_secret_accepts_long(self):
+        scope_utils.validate_secret("a" * 16)  # Should not raise
+
+    def test_validate_secret_rejects_empty(self):
+        with self.assertRaises(ValueError):
+            scope_utils.validate_secret("")
+
+    def test_canonicalize_targets_deduplicates_and_sorts(self):
+        result = scope_utils.canonicalize_targets(["example.com", "EXAMPLE.COM", "alpha.example.com"])
+        self.assertEqual(result, ["alpha.example.com", "example.com"])
+
+    def test_compute_signature_deterministic(self):
+        sig1 = scope_utils.compute_signature(["example.com", "10.0.0.1"], "secret123")
+        sig2 = scope_utils.compute_signature(["10.0.0.1", "example.com"], "secret123")
+        self.assertEqual(sig1, sig2)
+
+    def test_parse_targets_from_lines(self):
+        valid, invalid = scope_utils.parse_targets_from_lines(
+            ["https://api.example.com:443/path", "bad target", "10.0.0.1", ""]
+        )
+        self.assertEqual(valid, ["api.example.com", "10.0.0.1"])
+        self.assertEqual(invalid, ["bad target"])
+
+
 class ScopeValidatorTests(unittest.TestCase):
     def test_verify_signed_scope_rejects_non_list_targets(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
             scope.write_text(json.dumps({"allowed_targets": "example.com", "signature": "abc"}), encoding="utf-8")
             with self.assertRaises(ValueError):
-                asm.ScopeValidator.verify_signed_scope(str(scope), "secret")
+                scope_utils.verify_signed_scope(str(scope), "secret")
 
     def test_verify_signed_scope_accepts_valid_signature(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
-            _write_scope(scope, ["example.com"], "secret123")
-            verified = asm.ScopeValidator.verify_signed_scope(str(scope), "secret123")
+            _write_scope(scope, ["example.com"], "secret12345678ab")
+            verified = scope_utils.verify_signed_scope(str(scope), "secret12345678ab")
             self.assertEqual(verified, ["example.com"])
 
     def test_verify_signed_scope_rejects_wrong_secret(self):
-        """Issue #26: verify that a tampered or wrong secret is rejected."""
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
-            _write_scope(scope, ["example.com"], "correct-secret")
+            _write_scope(scope, ["example.com"], "correct-secret-1234")
             with self.assertRaises(ValueError) as ctx:
-                asm.ScopeValidator.verify_signed_scope(str(scope), "wrong-secret")
+                scope_utils.verify_signed_scope(str(scope), "wrong-secret-12345")
             self.assertIn("Invalid scope signature", str(ctx.exception))
 
     def test_verify_signed_scope_rejects_tampered_targets(self):
-        """Issue #26: verify that adding a target without re-signing is caught."""
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
-            data = _make_scope(["example.com"], "secret123")
-            # Inject a target without updating the signature
+            data = _make_scope(["example.com"], "secret12345678ab")
             data["allowed_targets"].append("evil.com")
             Path(scope).write_text(json.dumps(data), encoding="utf-8")
             with self.assertRaises(ValueError):
-                asm.ScopeValidator.verify_signed_scope(str(scope), "secret123")
+                scope_utils.verify_signed_scope(str(scope), "secret12345678ab")
 
     def test_verify_signed_scope_rejects_missing_file(self):
         with self.assertRaises(FileNotFoundError):
-            asm.ScopeValidator.verify_signed_scope("/nonexistent/scope.json", "secret")
+            scope_utils.verify_signed_scope("/nonexistent/scope.json", "secret")
 
     def test_verify_signed_scope_rejects_empty_signature(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
             scope.write_text(json.dumps({"allowed_targets": ["example.com"], "signature": "   "}), encoding="utf-8")
             with self.assertRaises(ValueError):
-                asm.ScopeValidator.verify_signed_scope(str(scope), "secret")
+                scope_utils.verify_signed_scope(str(scope), "secret")
 
     def test_canonicalized_signing_accepts_mixed_case(self):
-        """v3.4: mixed-case targets should verify because signing canonicalizes."""
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
-            _write_scope(scope, ["Example.COM", "API.Example.Com"], "secret123")
-            verified = asm.ScopeValidator.verify_signed_scope(str(scope), "secret123")
+            _write_scope(scope, ["Example.COM", "API.Example.Com"], "secret12345678ab")
+            verified = scope_utils.verify_signed_scope(str(scope), "secret12345678ab")
             self.assertEqual(verified, ["api.example.com", "example.com"])
+
+    def test_cidr_scope_round_trip(self):
+        """CIDR targets should survive sign → verify round-trip."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scope = Path(tmpdir) / "scope.json"
+            _write_scope(scope, ["192.168.1.0/24", "10.0.0.0/8"], "secret12345678ab")
+            verified = scope_utils.verify_signed_scope(str(scope), "secret12345678ab")
+            self.assertIn("192.168.1.0/24", verified)
+            self.assertIn("10.0.0.0/8", verified)
 
 
 class ScopeUpdateTests(unittest.TestCase):
-    """Issue #27: tests for update_and_resign."""
-
     def test_update_and_resign_creates_new_scope(self):
-        """Signing a new scope file from scratch when none exists."""
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
-            asm.ScopeValidator.update_and_resign(str(scope), ["example.com"], "secret123")
+            scope_utils.update_and_resign(str(scope), ["example.com"], "secret12345678ab")
 
             self.assertTrue(scope.exists())
             data = json.loads(scope.read_text(encoding="utf-8"))
             self.assertIn("example.com", data["allowed_targets"])
             self.assertIn("signature", data)
 
-            # Resulting file should verify cleanly
-            verified = asm.ScopeValidator.verify_signed_scope(str(scope), "secret123")
+            verified = scope_utils.verify_signed_scope(str(scope), "secret12345678ab")
             self.assertEqual(verified, ["example.com"])
 
     def test_update_and_resign_merges_targets(self):
-        """New targets are merged with existing, deduplicated, and sorted."""
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
-            _write_scope(scope, ["alpha.example.com"], "secret123")
+            _write_scope(scope, ["alpha.example.com"], "secret12345678ab")
 
-            asm.ScopeValidator.update_and_resign(
-                str(scope), ["beta.example.com", "alpha.example.com"], "secret123"
+            scope_utils.update_and_resign(
+                str(scope), ["beta.example.com", "alpha.example.com"], "secret12345678ab"
             )
 
-            verified = asm.ScopeValidator.verify_signed_scope(str(scope), "secret123")
+            verified = scope_utils.verify_signed_scope(str(scope), "secret12345678ab")
             self.assertEqual(verified, ["alpha.example.com", "beta.example.com"])
 
     def test_update_and_resign_canonicalizes(self):
-        """Targets with schemes/ports are canonicalized before merging."""
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
-            asm.ScopeValidator.update_and_resign(
-                str(scope), ["https://Example.com:443/path"], "secret123"
+            scope_utils.update_and_resign(
+                str(scope), ["https://Example.com:443/path"], "secret12345678ab"
             )
-            verified = asm.ScopeValidator.verify_signed_scope(str(scope), "secret123")
+            verified = scope_utils.verify_signed_scope(str(scope), "secret12345678ab")
             self.assertEqual(verified, ["example.com"])
 
     def test_update_and_resign_result_verifies(self):
-        """Round-trip: update then verify must succeed."""
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
             targets = ["10.0.0.1", "example.com", "192.168.1.0/24"]
-            asm.ScopeValidator.update_and_resign(str(scope), targets, "my-secret")
-            # Must not raise
-            verified = asm.ScopeValidator.verify_signed_scope(str(scope), "my-secret")
+            scope_utils.update_and_resign(str(scope), targets, "my-secret-is-long")
+            verified = scope_utils.verify_signed_scope(str(scope), "my-secret-is-long")
             self.assertEqual(len(verified), 3)
 
 
 class PolicyEngineTests(unittest.TestCase):
-    """Issue #27: tests for PolicyEngine with custom overrides."""
-
     def test_default_policy_matches_builtin_tools(self):
         policy = asm.PolicyEngine()
         self.assertTrue(policy.is_tool_allowed("nmap", "standard"))
@@ -146,7 +197,6 @@ class PolicyEngineTests(unittest.TestCase):
         self.assertTrue(policy.is_tool_allowed("nuclei", "deep"))
 
     def test_custom_policy_overrides_tools(self):
-        """A policy file can add tools to a depth level."""
         with tempfile.TemporaryDirectory() as tmpdir:
             policy_path = Path(tmpdir) / "policy.json"
             custom = {
@@ -164,7 +214,6 @@ class PolicyEngineTests(unittest.TestCase):
             self.assertFalse(engine.is_tool_allowed("nuclei", "deep"))
 
     def test_malformed_policy_raises(self):
-        """v3.4: malformed policy file raises instead of silently falling back."""
         with tempfile.TemporaryDirectory() as tmpdir:
             policy_path = Path(tmpdir) / "policy.json"
             policy_path.write_text("not valid json {{{", encoding="utf-8")
@@ -172,21 +221,16 @@ class PolicyEngineTests(unittest.TestCase):
                 asm.PolicyEngine(str(policy_path))
 
     def test_missing_policy_file_uses_defaults(self):
-        """A non-existent policy path falls back to built-in defaults."""
         engine = asm.PolicyEngine("/nonexistent/policy.json")
         self.assertTrue(engine.is_tool_allowed("nmap", "standard"))
 
 
 class AutoInstallTests(unittest.TestCase):
-    """Issue #27: tests for auto_install_missing."""
-
     def test_auto_install_skipped_on_non_kali(self):
-        """On non-Kali platforms, returns missing list without calling apt."""
         policy = asm.PolicyEngine()
         registry = asm.ToolRegistry(policy)
 
         with patch.object(asm, "IS_KALI", False):
-            # All tools are likely missing in the test env
             missing_before = registry.get_missing_tools("passive")
             if not missing_before:
                 self.skipTest("All passive tools are installed")
@@ -195,11 +239,9 @@ class AutoInstallTests(unittest.TestCase):
             self.assertEqual(set(still_missing), set(missing_before))
 
     def test_auto_install_calls_apt_on_kali(self):
-        """On Kali, apt-get install is called with the right packages."""
         policy = asm.PolicyEngine()
         registry = asm.ToolRegistry(policy)
 
-        # Pretend we're on Kali and only nmap is missing
         with patch.object(asm, "IS_KALI", True), \
              patch.object(asm.shutil, "which") as mock_which, \
              patch.object(asm.subprocess, "run") as mock_run:
@@ -208,14 +250,13 @@ class AutoInstallTests(unittest.TestCase):
                 if cmd == "apt-get":
                     return "/usr/bin/apt-get"
                 if cmd == "nmap":
-                    return None  # missing on first call
+                    return None
                 return f"/usr/bin/{cmd}"
 
             mock_which.side_effect = which_side_effect
 
             registry.auto_install_missing("standard")
 
-            # Verify apt-get install was called
             mock_run.assert_called_once()
             call_args = mock_run.call_args[0][0]
             self.assertEqual(call_args[0], "/usr/bin/apt-get")
@@ -223,11 +264,9 @@ class AutoInstallTests(unittest.TestCase):
             self.assertEqual(call_args[2], "-y")
 
     def test_auto_install_returns_empty_when_nothing_missing(self):
-        """When all tools are installed, returns empty list without calling apt."""
         policy = asm.PolicyEngine()
         registry = asm.ToolRegistry(policy)
 
-        # Pretend all tools are installed
         with patch.object(asm.Tool, "is_installed", return_value=True):
             result = registry.auto_install_missing("passive")
             self.assertEqual(result, [])
@@ -235,35 +274,53 @@ class AutoInstallTests(unittest.TestCase):
 
 class TargetParsingTests(unittest.TestCase):
     def test_parse_target_with_scheme_and_port(self):
-        parsed = asm.parse_and_canonicalize_target("https://api.example.com:443/path")
+        parsed = scope_utils.parse_and_canonicalize_target("https://api.example.com:443/path")
         self.assertEqual(parsed, "api.example.com")
 
     def test_sanitize_filename_fragment(self):
         cleaned = asm.sanitize_filename_fragment("2001:db8::1")
         self.assertNotIn(":", cleaned)
 
-    def test_parse_targets_from_lines_splits_valid_and_invalid(self):
-        valid, invalid = asm.parse_targets_from_lines(
-            ["https://api.example.com:443/path", "bad target", "10.0.0.1", ""]
-        )
-        self.assertEqual(valid, ["api.example.com", "10.0.0.1"])
-        self.assertEqual(invalid, ["bad target"])
-
     def test_parse_bare_ip(self):
-        self.assertEqual(asm.parse_and_canonicalize_target("10.0.0.1"), "10.0.0.1")
+        self.assertEqual(scope_utils.parse_and_canonicalize_target("10.0.0.1"), "10.0.0.1")
 
-    def test_parse_cidr_strips_prefix(self):
-        # The canonicalizer strips path-like suffixes including CIDR prefixes,
-        # then the bare IP is validated.  This is existing v3.3 behavior.
-        self.assertEqual(asm.parse_and_canonicalize_target("192.168.1.0/24"), "192.168.1.0")
+    def test_parse_cidr_preserves_prefix(self):
+        """v3.4.0: CIDR notation is now preserved (was stripped in v3.3)."""
+        self.assertEqual(scope_utils.parse_and_canonicalize_target("192.168.1.0/24"), "192.168.1.0/24")
+
+    def test_parse_cidr_normalizes_network(self):
+        """ip_network(strict=False) normalizes host bits."""
+        self.assertEqual(scope_utils.parse_and_canonicalize_target("192.168.1.5/24"), "192.168.1.0/24")
 
     def test_parse_rejects_garbage(self):
         with self.assertRaises(ValueError):
-            asm.parse_and_canonicalize_target("not a valid target!")
+            scope_utils.parse_and_canonicalize_target("not a valid target!")
 
-    def test_canonicalize_targets_deduplicates_and_sorts(self):
-        result = asm._canonicalize_targets(["example.com", "EXAMPLE.COM", "alpha.example.com"])
-        self.assertEqual(result, ["alpha.example.com", "example.com"])
+
+class RuntimeAcknowledgementTests(unittest.TestCase):
+    """Tests for ScopeValidator.runtime_acknowledgement() (fix #17)."""
+
+    def test_correct_acknowledgement_passes(self):
+        ack_string = "I ACKNOWLEDGE THIS SCAN IS AUTHORIZED AND WITHIN SCOPE"
+        with patch("builtins.input", return_value=ack_string):
+            # Should not raise
+            asm.ScopeValidator.runtime_acknowledgement()
+
+    def test_wrong_acknowledgement_raises(self):
+        with patch("builtins.input", return_value="nope"):
+            with self.assertRaises(PermissionError) as ctx:
+                asm.ScopeValidator.runtime_acknowledgement()
+            self.assertIn("Runtime acknowledgement failed", str(ctx.exception))
+
+    def test_empty_acknowledgement_raises(self):
+        with patch("builtins.input", return_value=""):
+            with self.assertRaises(PermissionError):
+                asm.ScopeValidator.runtime_acknowledgement()
+
+    def test_whitespace_padded_acknowledgement_passes(self):
+        ack_string = "  I ACKNOWLEDGE THIS SCAN IS AUTHORIZED AND WITHIN SCOPE  "
+        with patch("builtins.input", return_value=ack_string):
+            asm.ScopeValidator.runtime_acknowledgement()
 
 
 class CorrelationTests(unittest.TestCase):
@@ -350,7 +407,6 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(tool._parse_output("   \n  \n", "example.com"), [])
 
     def test_source_raw_is_populated(self):
-        """v3.4: source_raw should be set on all findings."""
         tool = asm.Tool("nuclei", ["nuclei"])
         output = '{"template-id":"test","info":{"severity":"high"}}\n'
         findings = tool._parse_output(output, "example.com")
@@ -361,13 +417,13 @@ class CLIMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_main_exits_on_invalid_cli_target(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
-            _write_scope(scope, ["example.com"], "secret123")
+            _write_scope(scope, ["example.com"], "secret12345678ab")
 
             args = [
                 "attack-surface-mapper.py",
                 "bad target",
                 "--scope-file", str(scope),
-                "--scope-secret", "secret123",
+                "--scope-secret", "secret12345678ab",
                 "--output-dir", str(Path(tmpdir) / "out"),
             ]
 
@@ -383,14 +439,14 @@ class CLIMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_main_exits_on_missing_targets_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             scope = Path(tmpdir) / "scope.json"
-            _write_scope(scope, ["example.com"], "secret123")
+            _write_scope(scope, ["example.com"], "secret12345678ab")
 
             missing_file = Path(tmpdir) / "does-not-exist.txt"
             args = [
                 "attack-surface-mapper.py",
                 "--file", str(missing_file),
                 "--scope-file", str(scope),
-                "--scope-secret", "secret123",
+                "--scope-secret", "secret12345678ab",
                 "--output-dir", str(Path(tmpdir) / "out"),
             ]
 
@@ -433,11 +489,10 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(len(json_lines), 1)
 
             csv_lines = csvf.read_text(encoding="utf-8").strip().splitlines()
-            self.assertGreaterEqual(len(csv_lines), 2)  # header + row
+            self.assertGreaterEqual(len(csv_lines), 2)
             self.assertIn("open_tcp_443", csv_lines[1])
 
     def test_source_raw_persisted_to_sqlite(self):
-        """v3.4: source_raw column must exist and store data."""
         with tempfile.TemporaryDirectory() as tmpdir:
             out = Path(tmpdir)
             db = asm.SQLiteDB(out / "findings.db")

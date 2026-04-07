@@ -1,6 +1,6 @@
 # Attack Surface Mapper
 
-Attack Surface Mapper is a Python-based recon orchestrator that enforces a **signed scope file** before running third-party discovery/scanning tools.
+Attack Surface Mapper (v3.4.0) is a Python-based recon orchestrator that enforces a **signed scope file** before running third-party discovery/scanning tools.
 
 ## Features
 
@@ -10,6 +10,7 @@ Attack Surface Mapper is a Python-based recon orchestrator that enforces a **sig
 - SQLite findings store with JSONL and CSV exports.
 - Optional scope update + re-sign workflow.
 - File logging to `recon.log` in the output directory.
+- Safe XML parsing via `defusedxml` (required dependency).
 
 ## Install
 
@@ -30,7 +31,7 @@ python3 create_scope.py
 Run a scan (recommended secret input method):
 
 ```bash
-export RECON_SCOPE_SECRET="your-secret"
+export RECON_SCOPE_SECRET="your-secret-min-16-chars"
 python3 attack-surface-mapper.py example.com \
   --scope-file scope.json \
   --depth standard \
@@ -59,7 +60,7 @@ attack-surface-mapper.py [target] [options]
 
 | Flag | Description | Default |
 |---|---|---|
-| `target` (positional) | Single target domain/IP | — |
+| `target` (positional) | Single target domain/IP/CIDR | — |
 | `--file`, `-f` | Path to a file with one target per line | — |
 | `--depth` | Scan depth: `passive`, `standard`, or `deep` | `standard` |
 | `--output-dir`, `-o` | Directory for all output artifacts | `./recon_results` |
@@ -72,15 +73,37 @@ attack-surface-mapper.py [target] [options]
 | `--auto-install` | Attempt `apt install` of missing tools (Kali Linux only) | off |
 | `--verbose`, `-v` | Print full tracebacks on unexpected errors | off |
 
+## Supported Target Formats
+
+Targets can be specified as:
+
+- **Domains:** `example.com`, `api.example.com`
+- **IPv4/IPv6 addresses:** `10.0.0.1`, `2001:db8::1`
+- **CIDR network ranges:** `192.168.1.0/24`, `10.0.0.0/8`
+- **URLs (scheme/port/path stripped):** `https://example.com:443/path` → `example.com`
+
+All targets are canonicalized (lowercased, deduplicated, sorted) before signing and verification.
+
 ## Signed-Scope and Runtime Acknowledgement
 
 Every scan requires two authorization gates:
 
-1. **Signed scope file** — `scope.json` contains an `allowed_targets` list and an HMAC-SHA256 `signature` computed over the canonicalized target list using a shared secret. The agent verifies this signature before proceeding. Use `create_scope.py` (or the one-liner in `one-liner-scope-creation.md`) to generate and sign the file. Use `--update-scope` with `--file` to merge new targets and re-sign automatically.
+1. **Signed scope file** — `scope.json` contains an `allowed_targets` list and an HMAC-SHA256 `signature` computed over the canonicalized target list using a shared secret (minimum 16 characters). The agent verifies this signature before proceeding. Use `create_scope.py` (or the one-liner in `one-liner-scope-creation.md`) to generate and sign the file. Use `--update-scope` with `--file` to merge new targets and re-sign automatically.
 
 2. **Runtime acknowledgement** — Before execution the operator must type an exact confirmation string at the interactive prompt. This prevents unattended or accidental scans. The mechanism is implemented in `ScopeValidator.runtime_acknowledgement()`.
 
 Together these ensure that (a) the target list has not been tampered with, and (b) a human operator explicitly authorizes each run. See `signed_scope_howto.md` for a detailed walkthrough.
+
+## Project Structure
+
+| File | Purpose |
+|---|---|
+| `scope_utils.py` | Shared canonicalization, HMAC signing, and scope validation logic |
+| `attack-surface-mapper.py` | Main recon orchestrator |
+| `create_scope.py` | CLI helper to create/sign scope files |
+| `external_tools.json` | Authoritative tool-to-depth mapping |
+
+All entry points (`attack-surface-mapper.py`, `create_scope.py`, doc snippets) import canonicalization from `scope_utils.py` to guarantee identical behavior.
 
 ## External Tool Dependencies
 
@@ -98,8 +121,9 @@ All outputs are written to the directory specified by `--output-dir`.
 
 | File | Format | Description |
 |---|---|---|
-| `findings.db` | SQLite | Primary data store. Single table `findings` with columns: `id` (TEXT PK), `tool`, `asset`, `indicator`, `value`, `type`, `severity`, `confidence` (REAL), `timestamp`, `correlated_to` (JSON array as TEXT). |
+| `findings.db` | SQLite | Primary data store. Single table `findings` with columns: `id` (TEXT PK), `tool`, `asset`, `indicator`, `value`, `type`, `severity`, `confidence` (REAL), `timestamp`, `source_raw`, `correlated_to` (JSON array as TEXT). |
 | `findings.jsonl` | JSON Lines | One JSON object per line, same columns as the SQLite table. |
 | `findings.csv` | CSV | Header row matching the SQLite columns, one finding per row. |
 | `recon.log` | Structured JSON log | Append-only structured log (one JSON object per line) from `structlog`. |
+| `spans.jsonl` | JSON Lines | OpenTelemetry trace spans. |
 | `raw_<target>_<tool>.txt` | Plain text | Raw stdout captured from each tool execution. |

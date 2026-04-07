@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "attack-surface-mapper"
-version = "3.3.0"
+version = "3.4.0"
 description = "Signed-scope recon orchestrator"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,4 +12,8 @@ dependencies = [
   "opentelemetry-api==1.40.0",
   "opentelemetry-sdk==1.40.0",
   "pydantic==2.11.3",
+  "defusedxml==0.7.1",
 ]
+
+[project.scripts]
+attack-surface-mapper = "attack_surface_mapper:main"
