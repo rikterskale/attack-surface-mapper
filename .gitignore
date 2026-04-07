@@ -2,3 +2,34 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime artifacts
+scope.json
+*.db
+recon.log
+spans.jsonl
+findings.jsonl
+findings.csv
+raw_*.txt
+
+# Output directories
+recon_results/
+results/
+
+# Environment / secrets
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

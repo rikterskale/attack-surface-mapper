@@ -1,10 +1,15 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-Safe Standalone Recon Agent - Enterprise Edition (v3.3)
+Safe Standalone Recon Agent - Enterprise Edition (v3.4)
+
+Signed-scope recon orchestrator that enforces HMAC-verified scope files
+and runtime operator acknowledgement before executing third-party
+discovery and scanning tools.
 """
 
 import argparse
 import asyncio
+import atexit
 import csv
 import hashlib
 import hmac
@@ -21,9 +26,10 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import structlog
@@ -31,6 +37,10 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
 
 IS_WINDOWS = platform.system() == "Windows"
 IS_KALI = bool(shutil.which("apt")) and "kali" in platform.platform().lower()
@@ -40,10 +50,30 @@ DEFAULT_WORDLIST = (
     else str(Path.home() / "wordlists" / "common.txt")
 )
 
+# ---------------------------------------------------------------------------
+# Non-transient exceptions that should NOT trigger a retry
+# ---------------------------------------------------------------------------
+
+_NON_TRANSIENT_ERRORS: Tuple[type, ...] = (
+    FileNotFoundError,
+    PermissionError,
+    NotADirectoryError,
+    IsADirectoryError,
+)
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
 _LOG_FILE_HANDLE = None
 
 
-def _configure_logger(log_path: Path | None = None):
+def _configure_logger(log_path: Optional[Path] = None):
+    """(Re)configure the global structlog pipeline.
+
+    If *log_path* is provided, structured JSON logs are appended to that file.
+    Otherwise logs go to the default print logger (stderr).
+    """
     global _LOG_FILE_HANDLE
     if _LOG_FILE_HANDLE:
         _LOG_FILE_HANDLE.close()
@@ -65,16 +95,39 @@ def _configure_logger(log_path: Path | None = None):
     )
 
 
+def _cleanup_log_handle():
+    """Close the log file handle on interpreter shutdown."""
+    global _LOG_FILE_HANDLE
+    if _LOG_FILE_HANDLE:
+        try:
+            _LOG_FILE_HANDLE.close()
+        except Exception:
+            pass
+        _LOG_FILE_HANDLE = None
+
+
+atexit.register(_cleanup_log_handle)
+
 _configure_logger()
 logger = structlog.get_logger("recon_agent")
 
+# ---------------------------------------------------------------------------
+# Tracing — spans are written to a file (not stdout) once main() sets up
+# the output directory.  At module level we only create the provider.
+# ---------------------------------------------------------------------------
+
 trace.set_tracer_provider(TracerProvider())
-tracer_provider = trace.get_tracer_provider()
-tracer_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+_tracer_provider = trace.get_tracer_provider()
 tracer = trace.get_tracer(__name__)
+
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
 
 class Finding(BaseModel):
+    """A single finding produced by a recon tool."""
+
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     tool: str
     asset: str
@@ -83,15 +136,16 @@ class Finding(BaseModel):
     type: str
     severity: str = "info"
     confidence: float = 0.8
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
-    source_raw: str | None = None
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    source_raw: Optional[str] = None
     correlated_to: List[str] = Field(default_factory=list)
 
 
-from enum import Enum
-
-
 class RunState(str, Enum):
+    """Lifecycle states for a recon run."""
+
     QUEUED = "queued"
     RUNNING = "running"
     PARTIAL_SUCCESS = "partial_success"
@@ -102,6 +156,8 @@ class RunState(str, Enum):
 
 @dataclass
 class RunStateMachine:
+    """Simple linear state machine with an audit trail of transitions."""
+
     state: RunState = RunState.QUEUED
     transitions: List[Tuple[str, str, float]] = field(default_factory=list)
 
@@ -113,14 +169,26 @@ class RunStateMachine:
         logger.info("state_transition", old_state=old.value, new_state=new_state.value)
 
 
+# ---------------------------------------------------------------------------
+# Policy engine
+# ---------------------------------------------------------------------------
+
+
 class PolicyEngine:
+    """Determines which tools are allowed at each scan depth.
+
+    Loads the authoritative mapping from ``external_tools.json`` next to this
+    script.  Falls back to a built-in copy if the file is missing.  A custom
+    policy JSON can overlay additional settings.
+    """
+
     _BUILTIN_TOOLS: Dict[str, List[str]] = {
         "passive": ["amass", "subfinder", "assetfinder", "knockpy", "theharvester", "sherlock"],
         "standard": ["nmap", "rustscan", "naabu", "whatweb", "httpx", "httprobe"],
         "deep": ["nuclei", "nikto", "gobuster", "feroxbuster", "dirsearch"],
     }
 
-    def __init__(self, policy_path: str | None = None):
+    def __init__(self, policy_path: Optional[str] = None):
         tools_map = self._load_external_tools_json()
         self.policy: Dict = {
             "allowed_tools": tools_map,
@@ -134,6 +202,9 @@ class PolicyEngine:
                 logger.info("policy_loaded", path=policy_path)
             except Exception as e:
                 logger.error("policy_load_failed", error=str(e))
+                raise ValueError(
+                    f"Failed to load policy file '{policy_path}': {e}"
+                ) from e
 
     @classmethod
     def _load_external_tools_json(cls) -> Dict[str, List[str]]:
@@ -154,86 +225,16 @@ class PolicyEngine:
         return tool in self.policy["allowed_tools"].get(depth, [])
 
 
-class ScopeValidator:
-    @staticmethod
-    def _validate_scope_schema(data: Dict[str, Any]) -> List[str]:
-        targets = data.get("allowed_targets")
-        signature = data.get("signature")
-
-        if not isinstance(targets, list):
-            raise ValueError("Scope file must contain 'allowed_targets' as a list")
-        if not all(isinstance(t, str) for t in targets):
-            raise ValueError("All entries in 'allowed_targets' must be strings")
-        if not isinstance(signature, str) or not signature.strip():
-            raise ValueError("Scope file missing signature")
-        return targets
-
-    @staticmethod
-    def verify_signed_scope(scope_file: str, secret: str) -> List[str]:
-        path = Path(scope_file)
-        if not path.exists():
-            raise FileNotFoundError(f"Scope file {scope_file} not found")
-
-        data = json.loads(path.read_text(encoding="utf-8"))
-        targets = ScopeValidator._validate_scope_schema(data)
-        signature = data["signature"]
-
-        payload = json.dumps({"allowed_targets": targets}, sort_keys=True).encode()
-        expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-
-        if not hmac.compare_digest(expected, signature):
-            raise ValueError("Invalid scope signature - authorization denied")
-
-        logger.info("scope_verified", targets_count=len(targets))
-        return targets
-
-    @staticmethod
-    def update_and_resign(scope_file: str, new_targets: List[str], secret: str):
-        logger.info("scope_update_starting", scope_file=scope_file, new_targets_provided=len(new_targets))
-
-        path = Path(scope_file)
-        try:
-            if path.exists():
-                data = json.loads(path.read_text(encoding="utf-8"))
-                existing = set(ScopeValidator._validate_scope_schema(data))
-            else:
-                existing = set()
-
-            merged = sorted(existing.union(set(new_targets)))
-            payload = json.dumps({"allowed_targets": merged}, sort_keys=True).encode()
-            signature = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-
-            updated = {"allowed_targets": merged, "signature": signature}
-            path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
-
-            logger.info(
-                "scope_update_success",
-                new_targets_added=len(merged) - len(existing),
-                total_targets=len(merged),
-                scope_file=scope_file,
-            )
-        except Exception as e:
-            logger.exception(
-                "scope_update_failed",
-                scope_file=scope_file,
-                error_type=type(e).__name__,
-                error=str(e),
-            )
-            raise
-
-    @staticmethod
-    def runtime_acknowledgement():
-        ack = "I ACKNOWLEDGE THIS SCAN IS AUTHORIZED AND WITHIN SCOPE"
-        print("\n" + "!" * 80)
-        print("EXPLICIT AUTHORIZATION REQUIRED")
-        print("!" * 80)
-        print(f"Type exactly: {ack}")
-        if input("→ ").strip() != ack:
-            raise PermissionError("Runtime acknowledgement failed - scan aborted")
-        logger.info("runtime_acknowledgement_passed")
+# ---------------------------------------------------------------------------
+# Scope validation
+# ---------------------------------------------------------------------------
 
 
 def parse_and_canonicalize_target(target: str) -> str:
+    """Normalize a user-supplied target string to a canonical lowercase form.
+
+    Strips schemes, ports, paths, and validates as an IP, CIDR, or domain.
+    """
     target = target.strip().lower()
     if "://" in target:
         parsed = urlparse(target)
@@ -262,12 +263,129 @@ def parse_and_canonicalize_target(target: str) -> str:
     raise ValueError(f"Invalid target format: {target}")
 
 
+def _canonicalize_targets(targets: List[str]) -> List[str]:
+    """Return a sorted, deduplicated, canonicalized copy of *targets*.
+
+    Invalid entries are silently dropped.  Callers that need diagnostics
+    should use :func:`parse_targets_from_lines` instead.
+    """
+    canonical: List[str] = []
+    for t in targets:
+        try:
+            canonical.append(parse_and_canonicalize_target(t))
+        except ValueError:
+            pass
+    return sorted(set(canonical))
+
+
+class ScopeValidator:
+    """Manages HMAC-signed scope files and runtime acknowledgement."""
+
+    @staticmethod
+    def _validate_scope_schema(data: Dict[str, Any]) -> List[str]:
+        """Validate the shape of a scope dict and return the target list."""
+        targets = data.get("allowed_targets")
+        signature = data.get("signature")
+
+        if not isinstance(targets, list):
+            raise ValueError("Scope file must contain 'allowed_targets' as a list")
+        if not all(isinstance(t, str) for t in targets):
+            raise ValueError("All entries in 'allowed_targets' must be strings")
+        if not isinstance(signature, str) or not signature.strip():
+            raise ValueError("Scope file missing signature")
+        return targets
+
+    @staticmethod
+    def _compute_signature(targets: List[str], secret: str) -> str:
+        """Compute HMAC-SHA256 over canonicalized, sorted targets."""
+        canonical = _canonicalize_targets(targets)
+        payload = json.dumps({"allowed_targets": canonical}, sort_keys=True).encode()
+        return hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def verify_signed_scope(scope_file: str, secret: str) -> List[str]:
+        """Verify the HMAC signature of *scope_file* and return allowed targets.
+
+        Targets are canonicalized before signature comparison so that case
+        differences between the file and the running scan do not cause
+        silent mismatches.
+        """
+        path = Path(scope_file)
+        if not path.exists():
+            raise FileNotFoundError(f"Scope file {scope_file} not found")
+
+        data = json.loads(path.read_text(encoding="utf-8"))
+        targets = ScopeValidator._validate_scope_schema(data)
+        signature = data["signature"]
+
+        expected = ScopeValidator._compute_signature(targets, secret)
+
+        if not hmac.compare_digest(expected, signature):
+            raise ValueError("Invalid scope signature - authorization denied")
+
+        logger.info("scope_verified", targets_count=len(targets))
+        return targets
+
+    @staticmethod
+    def update_and_resign(scope_file: str, new_targets: List[str], secret: str):
+        """Merge *new_targets* into the scope file, canonicalize, and re-sign."""
+        logger.info("scope_update_starting", scope_file=scope_file, new_targets_provided=len(new_targets))
+
+        path = Path(scope_file)
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                existing = set(ScopeValidator._validate_scope_schema(data))
+            else:
+                existing = set()
+
+            merged = _canonicalize_targets(list(existing) + new_targets)
+            signature = ScopeValidator._compute_signature(merged, secret)
+
+            updated = {"allowed_targets": merged, "signature": signature}
+            path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+
+            logger.info(
+                "scope_update_success",
+                new_targets_added=len(merged) - len(existing),
+                total_targets=len(merged),
+                scope_file=scope_file,
+            )
+        except Exception as e:
+            logger.exception(
+                "scope_update_failed",
+                scope_file=scope_file,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
+            raise
+
+    @staticmethod
+    def runtime_acknowledgement():
+        """Prompt the operator for explicit scan authorization."""
+        ack = "I ACKNOWLEDGE THIS SCAN IS AUTHORIZED AND WITHIN SCOPE"
+        print("\n" + "!" * 80)
+        print("EXPLICIT AUTHORIZATION REQUIRED")
+        print("!" * 80)
+        print(f"Type exactly: {ack}")
+        if input("\u2192 ").strip() != ack:
+            raise PermissionError("Runtime acknowledgement failed - scan aborted")
+        logger.info("runtime_acknowledgement_passed")
+
+
+# ---------------------------------------------------------------------------
+# Target helpers
+# ---------------------------------------------------------------------------
+
+
 def sanitize_filename_fragment(value: str) -> str:
+    """Produce a filesystem-safe fragment from an arbitrary string."""
     sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", value.strip())
     return sanitized or "unknown_target"
 
 
 def parse_targets_from_lines(lines: List[str]) -> Tuple[List[str], List[str]]:
+    """Split raw text lines into (valid_targets, invalid_targets)."""
     valid_targets: List[str] = []
     invalid_targets: List[str] = []
     for line in lines:
@@ -280,7 +398,14 @@ def parse_targets_from_lines(lines: List[str]) -> Tuple[List[str], List[str]]:
     return valid_targets, invalid_targets
 
 
+# ---------------------------------------------------------------------------
+# Correlation engine
+# ---------------------------------------------------------------------------
+
+
 class CorrelationEngine:
+    """Collects findings, deduplicates, and cross-references by asset."""
+
     def __init__(self):
         self.findings: List[Finding] = []
 
@@ -288,6 +413,7 @@ class CorrelationEngine:
         self.findings.append(finding)
 
     def deduplicate(self) -> List[Finding]:
+        """Remove findings with the same (tool, asset, indicator, severity)."""
         seen: set[tuple] = set()
         unique: List[Finding] = []
         for f in self.findings:
@@ -299,6 +425,7 @@ class CorrelationEngine:
 
     @staticmethod
     def correlate(findings: List[Finding]) -> List[Finding]:
+        """Populate ``correlated_to`` for vulnerability-type findings."""
         asset_map: Dict[str, List[str]] = {}
         for f in findings:
             asset_map.setdefault(f.asset, []).append(f.id)
@@ -309,7 +436,14 @@ class CorrelationEngine:
         return findings
 
 
+# ---------------------------------------------------------------------------
+# Tool abstraction
+# ---------------------------------------------------------------------------
+
+
 class Tool:
+    """Wraps an external recon binary with async execution and output parsing."""
+
     def __init__(
         self,
         name: str,
@@ -324,6 +458,7 @@ class Tool:
         self.extra_flags: List[str] = []
 
     def is_installed(self) -> bool:
+        """Check whether the underlying binary is on ``$PATH``."""
         executable = self.cmd_template[0] if self.cmd_template else self.name
         return shutil.which(executable) is not None
 
@@ -338,7 +473,17 @@ class Tool:
         output_dir: Path,
         retries: int = 2,
     ) -> List[Finding]:
+        """Run the tool against *target* and return parsed findings.
+
+        Logs a warning when the tool binary is not installed rather than
+        silently returning an empty list.
+        """
         if not self.is_installed():
+            logger.warning(
+                "tool_not_installed",
+                tool=self.name,
+                message=f"{self.name} is not installed -- skipping. Install it or use --auto-install on Kali.",
+            )
             return []
 
         async with semaphore:
@@ -368,10 +513,22 @@ class Tool:
                         if proc.returncode not in (0, None) and not output:
                             raise RuntimeError(err_output or f"{self.name} exited with code {proc.returncode}")
 
+                        if proc.returncode not in (0, None) and output:
+                            logger.warning(
+                                "tool_nonzero_exit_with_output",
+                                tool=self.name,
+                                target=target,
+                                returncode=proc.returncode,
+                                message="Tool exited non-zero but produced output -- parsing partial results.",
+                            )
+
                         findings = self._parse_output(output, target)
                         logger.info("tool_complete", tool=self.name, target=target, findings=len(findings))
                         return findings
 
+                    except _NON_TRANSIENT_ERRORS as e:
+                        logger.error("tool_failed_non_transient", tool=self.name, target=target, error=str(e))
+                        return []
                     except asyncio.TimeoutError:
                         if attempt == retries:
                             logger.error("tool_timeout", tool=self.name, target=target)
@@ -383,6 +540,10 @@ class Tool:
                         await asyncio.sleep(2 ** attempt)
 
             return []
+
+    # ------------------------------------------------------------------
+    # Output parsers
+    # ------------------------------------------------------------------
 
     def _parse_output(self, output: str, target: str) -> List[Finding]:
         if not output.strip():
@@ -408,6 +569,7 @@ class Tool:
                 value=line,
                 type="generic",
                 severity="info",
+                source_raw=line,
             )
             for line in lines
         ]
@@ -467,7 +629,11 @@ class Tool:
     def _parse_nmap_xml(self, output: str, target: str) -> List[Finding]:
         findings: List[Finding] = []
         try:
-            root = ET.fromstring(output)
+            try:
+                from defusedxml.ElementTree import fromstring as safe_fromstring
+                root = safe_fromstring(output)
+            except ImportError:
+                root = ET.fromstring(output)
         except ET.ParseError:
             return self._parse_generic_lines(output, target)
 
@@ -482,20 +648,29 @@ class Tool:
                 proto = port.get("protocol", "tcp")
                 svc_elem = port.find("service")
                 svc_name = svc_elem.get("name") if svc_elem is not None else "unknown"
+                raw = f"open {proto}/{port_id} service={svc_name}"
                 findings.append(
                     Finding(
                         tool=self.name,
                         asset=str(host_addr),
                         indicator=f"open_{proto}_{port_id}",
-                        value=f"open {proto}/{port_id} service={svc_name}",
+                        value=raw,
                         type="open_port",
                         severity="info",
+                        source_raw=raw,
                     )
                 )
         return findings
 
 
+# ---------------------------------------------------------------------------
+# Tool registry
+# ---------------------------------------------------------------------------
+
+
 class ToolRegistry:
+    """Creates and manages all known recon tools, filtered by policy."""
+
     def __init__(self, policy: PolicyEngine):
         self.tools: Dict[str, Tool] = {}
         self.policy = policy
@@ -519,28 +694,28 @@ class ToolRegistry:
             "dirsearch": "dirsearch",
         }
 
+        # -- passive --
         self.register("amass", ["amass", "enum", "-d", "{target}", "-o", "/dev/stdout", "-silent"])
         self.register("subfinder", ["subfinder", "-d", "{target}", "-silent", "-json"])
         self.register("assetfinder", ["assetfinder", "--subs-only", "{target}"])
         self.register("knockpy", ["knockpy", "{target}", "--no-color"])
-
         self.register("theharvester", ["theHarvester", "-d", "{target}", "-b", "all", "-l", "500"])
         self.register("sherlock", ["sherlock", "{target}", "--timeout", "10", "--print-found"])
 
+        # -- standard --
         self.register("nmap", ["nmap", "-T4", "-F", "--open", "-oX", "-", "{target}"])
         self.register("rustscan", ["rustscan", "-a", "{target}", "--ulimit", "5000", "--", "-sV"])
         self.register("naabu", ["naabu", "-host", "{target}", "-silent", "-json"])
-
         self.register("whatweb", ["whatweb", "--color=never", "--aggression=3", "{target}"])
         self.register("httpx", ["httpx", "-silent", "-json", "-status-code", "-title", "-tech-detect"], stdin_target=True)
         self.register("httprobe", ["httprobe", "-c", "50"], stdin_target=True)
 
+        # -- deep --
         self.register("nuclei", ["nuclei", "-silent", "-jsonl", "-severity", "critical,high"], stdin_target=True)
         self.register("nikto", ["nikto", "-h", "{target}", "-Format", "json", "-output", "/dev/stdout"])
-
-        self.register("gobuster", ["gobuster", "dir", "-u", "https://{target}", "-w", "{wordlist}", "-q", "-k", "--no-error"])
-        self.register("feroxbuster", ["feroxbuster", "-u", "https://{target}", "-w", "{wordlist}", "-q", "--no-state"])
-        self.register("dirsearch", ["dirsearch", "-u", "https://{target}", "-w", "{wordlist}", "-q", "-e", "php,asp,aspx,txt,html"])
+        self.register("gobuster", ["gobuster", "dir", "-u", "{target}", "-w", "{wordlist}", "-q", "-k", "--no-error"])
+        self.register("feroxbuster", ["feroxbuster", "-u", "{target}", "-w", "{wordlist}", "-q", "--no-state"])
+        self.register("dirsearch", ["dirsearch", "-u", "{target}", "-w", "{wordlist}", "-q", "-e", "php,asp,aspx,txt,html"])
 
     def register(self, name: str, cmd_template: List[str], stdin_target: bool = False):
         self.tools[name] = Tool(name, cmd_template, stdin_target=stdin_target)
@@ -552,6 +727,7 @@ class ToolRegistry:
         return [t for t in self.get_allowed_tools(depth) if not self.tools[t].is_installed()]
 
     def auto_install_missing(self, depth: str) -> List[str]:
+        """Attempt to ``apt install`` missing tools on Kali Linux."""
         missing = self.get_missing_tools(depth)
         if not missing:
             return []
@@ -575,7 +751,14 @@ class ToolRegistry:
         return self.get_missing_tools(depth)
 
 
+# ---------------------------------------------------------------------------
+# SQLite persistence
+# ---------------------------------------------------------------------------
+
+
 class SQLiteDB:
+    """Thin wrapper around a SQLite database for storing findings."""
+
     def __init__(self, db_path: Path):
         self.conn = sqlite3.connect(db_path)
         self.conn.execute(
@@ -584,16 +767,17 @@ class SQLiteDB:
                 id TEXT PRIMARY KEY,
                 tool TEXT, asset TEXT, indicator TEXT, value TEXT,
                 type TEXT, severity TEXT, confidence REAL,
-                timestamp TEXT, correlated_to TEXT
+                timestamp TEXT, source_raw TEXT, correlated_to TEXT
             )
             """
         )
         self.conn.commit()
 
     def add_finding(self, finding_dict: Dict):
+        """Insert a single finding.  Caller should use :meth:`commit` to batch."""
         self.conn.execute(
             """
-            INSERT INTO findings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO findings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 finding_dict["id"],
@@ -605,16 +789,27 @@ class SQLiteDB:
                 finding_dict["severity"],
                 finding_dict["confidence"],
                 finding_dict["timestamp"],
+                finding_dict.get("source_raw"),
                 json.dumps(finding_dict.get("correlated_to", [])),
             ),
         )
+
+    def commit(self):
+        """Explicitly commit the current transaction."""
         self.conn.commit()
 
     def close(self):
         self.conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Recon runner
+# ---------------------------------------------------------------------------
+
+
 class ReconAgentRun:
+    """Orchestrates a single recon run across all targets and tools."""
+
     def __init__(
         self,
         registry: ToolRegistry,
@@ -661,8 +856,11 @@ class ReconAgentRun:
 
         unique = self.correlator.deduplicate()
         correlated = CorrelationEngine.correlate(unique)
+
+        # Batch-insert all findings in a single transaction.
         for finding in correlated:
             self.db.add_finding(finding.model_dump())
+        self.db.commit()
 
         final_state = RunState.COMPLETED if not errors else RunState.PARTIAL_SUCCESS
         self.state.transition(final_state)
@@ -679,7 +877,13 @@ class ReconAgentRun:
         }
 
 
+# ---------------------------------------------------------------------------
+# Export helpers
+# ---------------------------------------------------------------------------
+
+
 def export_results(db: SQLiteDB, output_dir: Path):
+    """Write findings from SQLite to JSONL and CSV files."""
     cursor = db.conn.execute("SELECT * FROM findings")
     findings = cursor.fetchall()
     cols = [desc[0] for desc in cursor.description]
@@ -694,8 +898,13 @@ def export_results(db: SQLiteDB, output_dir: Path):
         writer.writerows(findings)
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Enterprise Recon Agent v3.3")
+    parser = argparse.ArgumentParser(description="Enterprise Recon Agent v3.4")
     parser.add_argument("target", nargs="?", help="Single target")
     parser.add_argument("--file", "-f", help="Targets file")
     parser.add_argument("--depth", choices=["passive", "standard", "deep"], default="standard")
@@ -720,7 +929,22 @@ async def main():
     global logger
     logger = structlog.get_logger("recon_agent")
 
-    logger.info("recon_started", version="3.3", depth=args.depth)
+    # Write span traces to a file instead of stdout.
+    try:
+        span_log_path = output_dir / "spans.jsonl"
+        _span_fh = open(span_log_path, "a", encoding="utf-8")
+
+        class _FileSpanExporter(ConsoleSpanExporter):
+            def __init__(self, fh):
+                super().__init__(out=fh)
+
+        _tracer_provider.add_span_processor(
+            BatchSpanProcessor(_FileSpanExporter(_span_fh))
+        )
+    except Exception as e:
+        logger.warning("span_exporter_setup_failed", error=str(e))
+
+    logger.info("recon_started", version="3.4", depth=args.depth)
 
     if args.scope_secret:
         logger.warning("scope_secret_cli_used", message="Prefer RECON_SCOPE_SECRET env var over --scope-secret")
@@ -728,9 +952,12 @@ async def main():
     secret = args.scope_secret or os.getenv("RECON_SCOPE_SECRET")
     if not secret:
         logger.error("missing_scope_secret")
-        print("❌ Error: Scope secret is required (set RECON_SCOPE_SECRET; --scope-secret is supported but discouraged)")
+        print("\u274c Error: Scope secret is required (set RECON_SCOPE_SECRET; --scope-secret is supported but discouraged)")
         sys.exit(1)
 
+    # ------------------------------------------------------------------
+    # Optional: merge targets file into scope and re-sign
+    # ------------------------------------------------------------------
     if args.update_scope and args.file:
         logger.info("scope_update_attempted", scope_file=args.scope_file, targets_file=args.file)
         try:
@@ -742,33 +969,41 @@ async def main():
 
             if not valid_targets:
                 logger.error("no_valid_targets_in_file", targets_file=args.file)
-                print("❌ Error: No valid targets found in targets file")
+                print("\u274c Error: No valid targets found in targets file")
                 sys.exit(1)
 
             ScopeValidator.update_and_resign(args.scope_file, valid_targets, secret)
         except FileNotFoundError:
             logger.error("targets_file_not_found", file=args.file)
-            print(f"❌ Error: Targets file '{args.file}' not found.")
+            print(f"\u274c Error: Targets file '{args.file}' not found.")
             sys.exit(1)
         except PermissionError:
             logger.error("permission_denied_updating_scope", scope_file=args.scope_file)
-            print(f"❌ Error: Cannot write to '{args.scope_file}' (permission denied).")
+            print(f"\u274c Error: Cannot write to '{args.scope_file}' (permission denied).")
             sys.exit(1)
         except ValueError as e:
             logger.error("scope_update_value_error", error=str(e))
-            print(f"❌ Scope update failed: {e}")
+            print(f"\u274c Scope update failed: {e}")
             sys.exit(1)
         except Exception:
             logger.exception("unexpected_scope_update_error", scope_file=args.scope_file, targets_file=args.file)
-            print("❌ Unexpected error while updating scope.")
+            print("\u274c Unexpected error while updating scope.")
             if args.verbose:
                 import traceback
 
                 traceback.print_exc()
             sys.exit(1)
 
-    ScopeValidator.runtime_acknowledgement()
+    # ------------------------------------------------------------------
+    # Gate 1: Verify signed scope FIRST
+    # ------------------------------------------------------------------
     allowed_targets = ScopeValidator.verify_signed_scope(args.scope_file, secret)
+
+    # ------------------------------------------------------------------
+    # Gate 2: Runtime operator acknowledgement (after scope is verified)
+    # ------------------------------------------------------------------
+    ScopeValidator.runtime_acknowledgement()
+
     canonical_allowed = set()
     for allowed in allowed_targets:
         try:
@@ -776,20 +1011,23 @@ async def main():
         except ValueError:
             logger.warning("invalid_allowed_target_in_scope", target=allowed)
 
+    # ------------------------------------------------------------------
+    # Collect and filter targets
+    # ------------------------------------------------------------------
     targets: List[str] = []
     if args.target:
         try:
             targets.append(parse_and_canonicalize_target(args.target))
         except ValueError as e:
             logger.error("invalid_cli_target", target=args.target, error=str(e))
-            print(f"❌ Error: Invalid target '{args.target}': {e}")
+            print(f"\u274c Error: Invalid target '{args.target}': {e}")
             sys.exit(1)
     if args.file:
         try:
             raw_lines = Path(args.file).read_text(encoding="utf-8").splitlines()
         except FileNotFoundError:
             logger.error("targets_file_not_found", file=args.file)
-            print(f"❌ Error: Targets file '{args.file}' not found.")
+            print(f"\u274c Error: Targets file '{args.file}' not found.")
             sys.exit(1)
 
         valid_targets, invalid_targets = parse_targets_from_lines(raw_lines)
@@ -802,6 +1040,9 @@ async def main():
         logger.error("no_valid_targets_in_scope")
         sys.exit(1)
 
+    # ------------------------------------------------------------------
+    # Build pipeline and run
+    # ------------------------------------------------------------------
     policy = PolicyEngine(args.policy)
     registry = ToolRegistry(policy)
     if args.auto_install:
