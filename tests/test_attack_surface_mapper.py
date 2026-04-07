@@ -459,6 +459,32 @@ class CLIMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     asm._configure_logger()
 
+    async def test_dry_run_exits_cleanly(self):
+        """--dry-run should print plan and return 0 without executing tools."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scope = Path(tmpdir) / "scope.json"
+            _write_scope(scope, ["example.com"], "secret12345678ab")
+
+            args = [
+                "attack-surface-mapper.py",
+                "example.com",
+                "--scope-file", str(scope),
+                "--scope-secret", "secret12345678ab",
+                "--output-dir", str(Path(tmpdir) / "out"),
+                "--depth", "passive",
+                "--dry-run",
+            ]
+
+            with patch.object(sys, "argv", args), \
+                 patch.object(asm.ScopeValidator, "runtime_acknowledgement", return_value=None):
+                try:
+                    result = await asm.main()
+                    self.assertEqual(result, 0)
+                    # Verify no findings.db was created (tools didn't run)
+                    self.assertFalse((Path(tmpdir) / "out" / "findings.db").exists())
+                finally:
+                    asm._configure_logger()
+
 
 class ExportTests(unittest.TestCase):
     def test_export_results_writes_jsonl_and_csv(self):

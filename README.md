@@ -71,6 +71,7 @@ attack-surface-mapper.py [target] [options]
 | `--update-scope` | Merge targets from `--file` into scope and re-sign before scanning | off |
 | `--policy` | Path to a policy JSON override file for `PolicyEngine` | — |
 | `--auto-install` | Attempt `apt install` of missing tools (Kali Linux only) | off |
+| `--dry-run` | Show targets, tools, and execution plan without running anything | off |
 | `--verbose`, `-v` | Print full tracebacks on unexpected errors | off |
 
 ## Supported Target Formats

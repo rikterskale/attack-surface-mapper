@@ -46,7 +46,11 @@ from scope_utils import (
     verify_signed_scope,
 )
 
-__version__ = "3.4.0"
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("attack-surface-mapper")
+except Exception:
+    __version__ = "3.4.0"  # fallback when running as uninstalled script
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -838,6 +842,7 @@ def parse_args():
     parser.add_argument("--update-scope", action="store_true", help="Auto-merge targets file into scope.json and re-sign")
     parser.add_argument("--policy", help="Policy JSON file")
     parser.add_argument("--auto-install", action="store_true", help="Attempt apt-based install of missing tools on Kali Linux")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would run without executing any tools")
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser.parse_args()
 
@@ -976,6 +981,33 @@ async def main():
     # ------------------------------------------------------------------
     policy = PolicyEngine(args.policy)
     registry = ToolRegistry(policy)
+
+    # ------------------------------------------------------------------
+    # Dry-run: show what would execute, then exit (suggestion #9)
+    # ------------------------------------------------------------------
+    if args.dry_run:
+        allowed_tools = registry.get_allowed_tools(args.depth)
+        missing = registry.get_missing_tools(args.depth)
+        installed = [t for t in allowed_tools if t not in missing]
+
+        print("\n" + "=" * 80)
+        print("DRY RUN — no tools will be executed")
+        print("=" * 80)
+        print(f"\nDepth:   {args.depth}")
+        print(f"Targets: ({len(targets)})")
+        for t in targets:
+            print(f"  • {t}")
+        print(f"\nTools allowed at '{args.depth}' depth: ({len(allowed_tools)})")
+        for t in allowed_tools:
+            status = "✅ installed" if t in installed else "❌ MISSING"
+            print(f"  • {t:20s} {status}")
+        print(f"\nTotal executions: {len(targets)} targets × {len(installed)} installed tools = {len(targets) * len(installed)}")
+        if missing:
+            print(f"\n⚠  {len(missing)} tools missing: {', '.join(missing)}")
+            print("   Install them or use --auto-install on Kali.")
+        print()
+        return 0
+
     if args.auto_install:
         remaining_missing = registry.auto_install_missing(args.depth)
         if remaining_missing:
