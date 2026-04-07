@@ -16,4 +16,44 @@ dependencies = [
 ]
 
 [project.scripts]
-attack-surface-mapper = "attack_surface_mapper:main"
+attack-surface-mapper = "attack_surface_mapper:cli"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "mypy>=1.11",
+  "ruff>=0.6",
+]
+
+# ------------------------------------------------------------------
+# Tool configuration
+# ------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = [
+  "structlog.*",
+  "opentelemetry.*",
+  "defusedxml.*",
+]
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "S"]
+# S603/S607: subprocess calls are intentional (recon tool execution)
+# S108: /tmp usage is acceptable in test helpers
+ignore = ["S603", "S607", "S108"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+verbosity = 2

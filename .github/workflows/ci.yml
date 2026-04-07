@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Verify pip install -e . succeeds
+        run: |
+          # Confirm the console script entry point resolves
+          python -c "from attack_surface_mapper import cli; print('entry point OK')"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type check (mypy)
+        if: matrix.python-version == '3.12'  # run once, not per-version
+        run: mypy --strict attack_surface_mapper.py scope_utils.py create_scope.py
+
+      - name: Test
+        run: pytest tests/ -v
+
+      - name: Check no .pyc in repo
+        run: |
+          if find . -name '*.pyc' -not -path './.git/*' | grep -q .; then
+            echo "ERROR: .pyc files found in repo"
+            find . -name '*.pyc' -not -path './.git/*'
+            exit 1
+          fi

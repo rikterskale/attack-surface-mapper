@@ -10,12 +10,12 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 # ---------------------------------------------------------------------------
-# Import the main module via importlib (hyphenated filename).
-# Note: this executes module-level code (logging/tracing setup) as a side
-# effect.  Acceptable for a test suite that runs in its own process.
+# Import the main module.  The file was renamed from hyphenated to
+# underscored so a standard import works, but we keep importlib for
+# consistency with the existing test pattern.
 # ---------------------------------------------------------------------------
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "attack-surface-mapper.py"
+MODULE_PATH = Path(__file__).resolve().parents[1] / "attack_surface_mapper.py"
 spec = importlib.util.spec_from_file_location("attack_surface_mapper", MODULE_PATH)
 asm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(asm)
@@ -143,6 +143,38 @@ class ScopeValidatorTests(unittest.TestCase):
             verified = scope_utils.verify_signed_scope(str(scope), "secret12345678ab")
             self.assertIn("192.168.1.0/24", verified)
             self.assertIn("10.0.0.0/8", verified)
+
+
+class CIDRScopeMatchingTests(unittest.TestCase):
+    """Tests for is_target_in_scope CIDR-aware matching (fix #2)."""
+
+    def test_exact_match(self):
+        self.assertTrue(scope_utils.is_target_in_scope("example.com", {"example.com"}))
+
+    def test_no_match(self):
+        self.assertFalse(scope_utils.is_target_in_scope("evil.com", {"example.com"}))
+
+    def test_ip_in_cidr(self):
+        self.assertTrue(scope_utils.is_target_in_scope("192.168.1.50", {"192.168.1.0/24"}))
+
+    def test_ip_outside_cidr(self):
+        self.assertFalse(scope_utils.is_target_in_scope("10.0.0.1", {"192.168.1.0/24"}))
+
+    def test_cidr_exact_match(self):
+        self.assertTrue(scope_utils.is_target_in_scope("192.168.1.0/24", {"192.168.1.0/24"}))
+
+    def test_domain_not_matched_by_cidr(self):
+        self.assertFalse(scope_utils.is_target_in_scope("example.com", {"192.168.1.0/24"}))
+
+    def test_ip_matched_by_multiple_scope_entries(self):
+        allowed = {"example.com", "10.0.0.0/8"}
+        self.assertTrue(scope_utils.is_target_in_scope("10.1.2.3", allowed))
+
+    def test_ipv6_in_cidr(self):
+        self.assertTrue(scope_utils.is_target_in_scope("2001:db8::1", {"2001:db8::/32"}))
+
+    def test_ipv6_outside_cidr(self):
+        self.assertFalse(scope_utils.is_target_in_scope("2001:db9::1", {"2001:db8::/32"}))
 
 
 class ScopeUpdateTests(unittest.TestCase):
@@ -296,6 +328,11 @@ class TargetParsingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             scope_utils.parse_and_canonicalize_target("not a valid target!")
 
+    def test_bare_ipv6_not_stripped(self):
+        """Bare IPv6 like 2001:db8::80 must not have :80 stripped as a port."""
+        result = scope_utils.parse_and_canonicalize_target("2001:db8::80")
+        self.assertEqual(result, "2001:db8::80")
+
 
 class RuntimeAcknowledgementTests(unittest.TestCase):
     """Tests for ScopeValidator.runtime_acknowledgement() (fix #17)."""
@@ -420,7 +457,7 @@ class CLIMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             _write_scope(scope, ["example.com"], "secret12345678ab")
 
             args = [
-                "attack-surface-mapper.py",
+                "attack_surface_mapper.py",
                 "bad target",
                 "--scope-file", str(scope),
                 "--scope-secret", "secret12345678ab",
@@ -443,7 +480,7 @@ class CLIMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             missing_file = Path(tmpdir) / "does-not-exist.txt"
             args = [
-                "attack-surface-mapper.py",
+                "attack_surface_mapper.py",
                 "--file", str(missing_file),
                 "--scope-file", str(scope),
                 "--scope-secret", "secret12345678ab",
@@ -466,7 +503,7 @@ class CLIMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
             _write_scope(scope, ["example.com"], "secret12345678ab")
 
             args = [
-                "attack-surface-mapper.py",
+                "attack_surface_mapper.py",
                 "example.com",
                 "--scope-file", str(scope),
                 "--scope-secret", "secret12345678ab",

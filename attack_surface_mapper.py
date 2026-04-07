@@ -38,6 +38,7 @@ from scope_utils import (
     MIN_SECRET_LENGTH,
     canonicalize_targets,
     compute_signature,
+    is_target_in_scope,
     parse_and_canonicalize_target,
     parse_targets_from_lines,
     update_and_resign,
@@ -87,16 +88,19 @@ def _configure_logger(log_path: Optional[Path] = None):
 
     If *log_path* is provided, structured JSON logs are appended to that file.
     Otherwise logs go to the default print logger (stderr).
+
+    The new factory is installed before the old file handle is closed so
+    that concurrent log calls never hit a closed handle.
     """
     global _LOG_FILE_HANDLE
-    if _LOG_FILE_HANDLE:
-        _LOG_FILE_HANDLE.close()
-        _LOG_FILE_HANDLE = None
+    old_handle = _LOG_FILE_HANDLE
 
     logger_factory = structlog.PrintLoggerFactory()
     if log_path:
         _LOG_FILE_HANDLE = open(log_path, "a", encoding="utf-8")
         logger_factory = structlog.WriteLoggerFactory(file=_LOG_FILE_HANDLE)
+    else:
+        _LOG_FILE_HANDLE = None
 
     structlog.configure(
         processors=[
@@ -107,6 +111,13 @@ def _configure_logger(log_path: Optional[Path] = None):
         ],
         logger_factory=logger_factory,
     )
+
+    # Close the previous handle *after* structlog is reconfigured.
+    if old_handle:
+        try:
+            old_handle.close()
+        except Exception:
+            pass
 
 
 def _cleanup_log_handle():
@@ -166,7 +177,7 @@ class Finding(BaseModel):
     value: str
     type: str
     severity: str = "info"
-    confidence: float = 0.8
+    confidence: float = 0.5
     timestamp: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -371,17 +382,32 @@ class CorrelationEngine:
 class Tool:
     """Wraps an external recon binary with async execution and output parsing."""
 
+    # Per-tool default confidence — structured parsers get higher confidence
+    # than generic line parsers because findings are validated/typed.
+    _CONFIDENCE: Dict[str, float] = {
+        "nuclei": 0.9,
+        "nmap": 0.9,
+        "subfinder": 0.85,
+        "httpx": 0.85,
+        "naabu": 0.85,
+        "nikto": 0.8,
+        "whatweb": 0.75,
+    }
+    _DEFAULT_CONFIDENCE: float = 0.5
+
     def __init__(
         self,
         name: str,
         cmd_template: List[str],
         timeout: int = 180,
         stdin_target: bool = False,
+        supports_cidr: bool = False,
     ):
         self.name = name
         self.cmd_template = cmd_template
         self.timeout = timeout
         self.stdin_target = stdin_target
+        self.supports_cidr = supports_cidr
         self.extra_flags: List[str] = []
 
     def is_installed(self) -> bool:
@@ -412,6 +438,21 @@ class Tool:
                 message=f"{self.name} is not installed -- skipping. Install it or use --auto-install on Kali.",
             )
             return []
+
+        # Skip tools that don't understand CIDR when given a network target.
+        if "/" in target and not self.supports_cidr:
+            try:
+                import ipaddress as _ipa
+                _ipa.ip_network(target, strict=False)
+                logger.warning(
+                    "tool_skipped_cidr",
+                    tool=self.name,
+                    target=target,
+                    message=f"{self.name} does not support CIDR targets -- skipping {target}.",
+                )
+                return []
+            except ValueError:
+                pass  # Not actually a CIDR — proceed normally
 
         async with semaphore:
             cmd = self._build_command(target)
@@ -488,6 +529,7 @@ class Tool:
 
     def _parse_generic_lines(self, output: str, target: str) -> List[Finding]:
         lines = [line.strip() for line in output.splitlines() if line.strip()]
+        conf = self._CONFIDENCE.get(self.name, self._DEFAULT_CONFIDENCE)
         return [
             Finding(
                 tool=self.name,
@@ -496,6 +538,7 @@ class Tool:
                 value=line,
                 type="generic",
                 severity="info",
+                confidence=conf,
                 source_raw=line,
             )
             for line in lines
@@ -548,6 +591,7 @@ class Tool:
                     value=str(value),
                     type=finding_type,
                     severity=severity,
+                    confidence=self._CONFIDENCE.get(self.name, self._DEFAULT_CONFIDENCE),
                     source_raw=line,
                 )
             )
@@ -581,6 +625,7 @@ class Tool:
                         value=raw,
                         type="open_port",
                         severity="info",
+                        confidence=self._CONFIDENCE.get(self.name, self._DEFAULT_CONFIDENCE),
                         source_raw=raw,
                     )
                 )
@@ -627,9 +672,9 @@ class ToolRegistry:
         self.register("sherlock", ["sherlock", "{target}", "--timeout", "10", "--print-found"])
 
         # -- standard --
-        self.register("nmap", ["nmap", "-T4", "-F", "--open", "-oX", "-", "{target}"])
-        self.register("rustscan", ["rustscan", "-a", "{target}", "--ulimit", "5000", "--", "-sV"])
-        self.register("naabu", ["naabu", "-host", "{target}", "-silent", "-json"])
+        self.register("nmap", ["nmap", "-T4", "-F", "--open", "-oX", "-", "{target}"], supports_cidr=True)
+        self.register("rustscan", ["rustscan", "-a", "{target}", "--ulimit", "5000", "--", "-sV"], supports_cidr=True)
+        self.register("naabu", ["naabu", "-host", "{target}", "-silent", "-json"], supports_cidr=True)
         self.register("whatweb", ["whatweb", "--color=never", "--aggression=3", "{target}"])
         self.register("httpx", ["httpx", "-silent", "-json", "-status-code", "-title", "-tech-detect"], stdin_target=True)
         self.register("httprobe", ["httprobe", "-c", "50"], stdin_target=True)
@@ -641,8 +686,8 @@ class ToolRegistry:
         self.register("feroxbuster", ["feroxbuster", "-u", "{target}", "-w", "{wordlist}", "-q", "--no-state"])
         self.register("dirsearch", ["dirsearch", "-u", "{target}", "-w", "{wordlist}", "-q", "-e", "php,asp,aspx,txt,html"])
 
-    def register(self, name: str, cmd_template: List[str], stdin_target: bool = False):
-        self.tools[name] = Tool(name, cmd_template, stdin_target=stdin_target)
+    def register(self, name: str, cmd_template: List[str], stdin_target: bool = False, supports_cidr: bool = False):
+        self.tools[name] = Tool(name, cmd_template, stdin_target=stdin_target, supports_cidr=supports_cidr)
 
     def get_allowed_tools(self, depth: str) -> List[str]:
         return [t for t in self.tools if self.policy.is_tool_allowed(t, depth)]
@@ -666,6 +711,12 @@ class ToolRegistry:
 
         packages = sorted({self.package_map.get(tool, tool) for tool in missing})
         cmd = [apt, "install", "-y", *packages]
+        if os.getuid() != 0:
+            sudo = shutil.which("sudo")
+            if not sudo:
+                logger.warning("auto_install_needs_root", missing=missing)
+                return missing
+            cmd = [sudo] + cmd
         try:
             logger.info("auto_install_start", packages=packages, command=" ".join(cmd))
             subprocess.run(cmd, check=True)
@@ -843,6 +894,10 @@ def parse_args():
     parser.add_argument("--policy", help="Policy JSON file")
     parser.add_argument("--auto-install", action="store_true", help="Attempt apt-based install of missing tools on Kali Linux")
     parser.add_argument("--dry-run", action="store_true", help="Show what would run without executing any tools")
+    parser.add_argument(
+        "--no-ack", action="store_true",
+        help="Skip interactive acknowledgement prompt (requires RECON_UNATTENDED=1 env var as safety gate)",
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser.parse_args()
 
@@ -892,23 +947,35 @@ async def main():
         sys.exit(1)
 
     # ------------------------------------------------------------------
+    # Read targets file once (reused for --update-scope and target list)
+    # ------------------------------------------------------------------
+    file_valid: List[str] = []
+    file_invalid: List[str] = []
+
+    if args.file:
+        try:
+            file_lines = Path(args.file).read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            logger.error("targets_file_not_found", file=args.file)
+            print(f"\u274c Error: Targets file '{args.file}' not found.")
+            sys.exit(1)
+
+        file_valid, file_invalid = parse_targets_from_lines(file_lines)
+        if file_invalid:
+            logger.warning("invalid_targets_skipped", count=len(file_invalid), examples=file_invalid[:5])
+
+    # ------------------------------------------------------------------
     # Optional: merge targets file into scope and re-sign
     # ------------------------------------------------------------------
     if args.update_scope and args.file:
         logger.info("scope_update_attempted", scope_file=args.scope_file, targets_file=args.file)
         try:
-            raw_lines = Path(args.file).read_text(encoding="utf-8").splitlines()
-            valid_targets, invalid_targets = parse_targets_from_lines(raw_lines)
-
-            if invalid_targets:
-                logger.warning("invalid_targets_skipped", count=len(invalid_targets), examples=invalid_targets[:5])
-
-            if not valid_targets:
+            if not file_valid:
                 logger.error("no_valid_targets_in_file", targets_file=args.file)
                 print("\u274c Error: No valid targets found in targets file")
                 sys.exit(1)
 
-            ScopeValidator.update_and_resign(args.scope_file, valid_targets, secret)
+            ScopeValidator.update_and_resign(args.scope_file, file_valid, secret)
         except FileNotFoundError:
             logger.error("targets_file_not_found", file=args.file)
             print(f"\u274c Error: Targets file '{args.file}' not found.")
@@ -935,11 +1002,6 @@ async def main():
     # ------------------------------------------------------------------
     allowed_targets = ScopeValidator.verify_signed_scope(args.scope_file, secret)
 
-    # ------------------------------------------------------------------
-    # Gate 2: Runtime operator acknowledgement (after scope is verified)
-    # ------------------------------------------------------------------
-    ScopeValidator.runtime_acknowledgement()
-
     canonical_allowed = set()
     for allowed in allowed_targets:
         try:
@@ -948,7 +1010,7 @@ async def main():
             logger.warning("invalid_allowed_target_in_scope", target=allowed)
 
     # ------------------------------------------------------------------
-    # Collect and filter targets
+    # Collect and filter targets (uses CIDR-aware matching)
     # ------------------------------------------------------------------
     targets: List[str] = []
     if args.target:
@@ -959,31 +1021,22 @@ async def main():
             print(f"\u274c Error: Invalid target '{args.target}': {e}")
             sys.exit(1)
     if args.file:
-        try:
-            raw_lines = Path(args.file).read_text(encoding="utf-8").splitlines()
-        except FileNotFoundError:
-            logger.error("targets_file_not_found", file=args.file)
-            print(f"\u274c Error: Targets file '{args.file}' not found.")
-            sys.exit(1)
+        targets.extend(file_valid)
 
-        valid_targets, invalid_targets = parse_targets_from_lines(raw_lines)
-        if invalid_targets:
-            logger.warning("invalid_targets_skipped", count=len(invalid_targets), examples=invalid_targets[:5])
-        targets.extend(valid_targets)
-
-    targets = [t for t in targets if t in canonical_allowed]
+    targets = [t for t in targets if is_target_in_scope(t, canonical_allowed)]
     if not targets:
         logger.error("no_valid_targets_in_scope")
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # Build pipeline and run
+    # Build pipeline
     # ------------------------------------------------------------------
     policy = PolicyEngine(args.policy)
     registry = ToolRegistry(policy)
 
     # ------------------------------------------------------------------
-    # Dry-run: show what would execute, then exit (suggestion #9)
+    # Dry-run: show what would execute, then exit — BEFORE acknowledgement
+    # so operators can preview without typing the full ack string.
     # ------------------------------------------------------------------
     if args.dry_run:
         allowed_tools = registry.get_allowed_tools(args.depth)
@@ -1008,6 +1061,19 @@ async def main():
         print()
         return 0
 
+    # ------------------------------------------------------------------
+    # Gate 2: Runtime operator acknowledgement (after scope is verified,
+    # but skipped for --dry-run above and --no-ack in CI/automated mode)
+    # ------------------------------------------------------------------
+    if args.no_ack:
+        if os.getenv("RECON_UNATTENDED") != "1":
+            logger.error("no_ack_requires_env_var")
+            print("\u274c Error: --no-ack requires RECON_UNATTENDED=1 environment variable as a safety gate.")
+            sys.exit(1)
+        logger.info("runtime_acknowledgement_skipped", reason="--no-ack with RECON_UNATTENDED=1")
+    else:
+        ScopeValidator.runtime_acknowledgement()
+
     if args.auto_install:
         remaining_missing = registry.auto_install_missing(args.depth)
         if remaining_missing:
@@ -1018,14 +1084,16 @@ async def main():
         logger.warning("missing_tools", depth=args.depth, tools=missing_tools)
 
     db = SQLiteDB(output_dir / "findings.db")
-    semaphore = asyncio.Semaphore(args.threads)
-    state_machine = RunStateMachine()
+    try:
+        semaphore = asyncio.Semaphore(args.threads)
+        state_machine = RunStateMachine()
 
-    agent = ReconAgentRun(registry, db, semaphore, output_dir, args.retries, state_machine)
-    result = await agent.run_recon(targets, args.depth)
+        agent = ReconAgentRun(registry, db, semaphore, output_dir, args.retries, state_machine)
+        result = await agent.run_recon(targets, args.depth)
 
-    export_results(db, output_dir)
-    db.close()
+        export_results(db, output_dir)
+    finally:
+        db.close()
 
     logger.info("recon_completed", **result)
     print("\n" + "=" * 80)
@@ -1035,7 +1103,8 @@ async def main():
     return 0
 
 
-if __name__ == "__main__":
+def cli():
+    """Synchronous entry point used by ``[project.scripts]``."""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
@@ -1044,3 +1113,7 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical("fatal_error", error=str(e))
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    cli()

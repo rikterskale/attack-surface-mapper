@@ -53,8 +53,11 @@ def parse_and_canonicalize_target(target: str) -> str:
             # URL path — discard
             target = head
 
-    # Strip port (but not from bracketed IPv6)
-    if ":" in target and not target.startswith("["):
+    # Strip port — but only when there is exactly one colon (host:port).
+    # Multiple colons indicate a bare IPv6 address (e.g. 2001:db8::80)
+    # which must not have its last segment mistaken for a port.
+    # Bracketed IPv6 like [::1]:8080 is handled by urlparse above.
+    if target.count(":") == 1:
         host, port = target.rsplit(":", 1)
         if port.isdigit():
             target = host
@@ -107,6 +110,33 @@ def parse_targets_from_lines(lines: List[str]) -> Tuple[List[str], List[str]]:
         except ValueError:
             invalid_targets.append(line.strip())
     return valid_targets, invalid_targets
+
+
+def is_target_in_scope(target: str, allowed_targets: set) -> bool:
+    """Check whether *target* is authorized by *allowed_targets*.
+
+    Performs exact string matching first, then checks whether *target*
+    is an IP address that falls within any CIDR network entry in the
+    allowed set.  This allows a scope entry like ``10.0.0.0/24`` to
+    authorize individual IPs such as ``10.0.0.1``.
+    """
+    if target in allowed_targets:
+        return True
+
+    # Check if target is an IP that falls within a CIDR scope entry
+    try:
+        target_addr = ipaddress.ip_address(target)
+    except ValueError:
+        return False  # Not an IP — only exact match applies
+
+    for allowed in allowed_targets:
+        try:
+            network = ipaddress.ip_network(allowed, strict=False)
+            if target_addr in network:
+                return True
+        except ValueError:
+            continue  # Not a network entry — skip
+    return False
 
 
 # ---------------------------------------------------------------------------

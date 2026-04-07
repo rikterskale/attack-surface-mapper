@@ -61,7 +61,7 @@ See `one-liner-scope-creation.md` for a single shell command version.
 
 ```bash
 export RECON_SCOPE_SECRET="your-secret-min-16-chars"
-python3 attack-surface-mapper.py example.com \
+python3 attack_surface_mapper.py example.com \
   --scope-file scope.json \
   --depth standard \
   --output-dir results/example.com
@@ -78,7 +78,7 @@ The scanner will:
 ## Step 3: Optional scope update from file
 
 ```bash
-python3 attack-surface-mapper.py --file targets.txt \
+python3 attack_surface_mapper.py --file targets.txt \
   --scope-file scope.json \
   --update-scope \
   --depth passive
@@ -102,6 +102,6 @@ The HMAC-SHA256 signature is computed over a JSON payload containing the **canon
 HMAC-SHA256(secret, '{"allowed_targets": ["192.168.1.0/24", "api.example.com", "example.com"]}')
 ```
 
-Canonicalization ensures that the signing tool (`create_scope.py`) and the scanner (`attack-surface-mapper.py`) always agree on the payload, regardless of how the operator originally formatted the targets. Both import their canonicalization logic from `scope_utils.py`.
+Canonicalization ensures that the signing tool (`create_scope.py`) and the scanner (`attack_surface_mapper.py`) always agree on the payload, regardless of how the operator originally formatted the targets. Both import their canonicalization logic from `scope_utils.py`.
 
 If the signature doesn't match at scan time, the scanner aborts immediately before any tools are invoked.

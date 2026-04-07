@@ -37,7 +37,7 @@ Single target (passive — no direct target interaction):
 
 ```bash
 export RECON_SCOPE_SECRET="your-secret-min-16-chars"
-python3 attack-surface-mapper.py example.com \
+python3 attack_surface_mapper.py example.com \
   --scope-file scope.json \
   --depth passive \
   --output-dir results/example.com
@@ -46,7 +46,7 @@ python3 attack-surface-mapper.py example.com \
 Multiple targets with scope auto-update:
 
 ```bash
-python3 attack-surface-mapper.py --file targets.txt \
+python3 attack_surface_mapper.py --file targets.txt \
   --scope-file scope.json \
   --update-scope \
   --depth standard \
@@ -57,7 +57,7 @@ python3 attack-surface-mapper.py --file targets.txt \
 Optional: auto-install missing tools on Kali:
 
 ```bash
-python3 attack-surface-mapper.py example.com \
+python3 attack_surface_mapper.py example.com \
   --scope-file scope.json \
   --depth standard \
   --auto-install

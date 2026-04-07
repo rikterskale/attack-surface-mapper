@@ -32,7 +32,7 @@ Run a scan (recommended secret input method):
 
 ```bash
 export RECON_SCOPE_SECRET="your-secret-min-16-chars"
-python3 attack-surface-mapper.py example.com \
+python3 attack_surface_mapper.py example.com \
   --scope-file scope.json \
   --depth standard \
   --output-dir results/example.com
@@ -55,7 +55,7 @@ The authoritative tool-to-depth mapping is defined in `external_tools.json` and 
 ## CLI Reference
 
 ```
-attack-surface-mapper.py [target] [options]
+attack_surface_mapper.py [target] [options]
 ```
 
 | Flag | Description | Default |
@@ -71,7 +71,8 @@ attack-surface-mapper.py [target] [options]
 | `--update-scope` | Merge targets from `--file` into scope and re-sign before scanning | off |
 | `--policy` | Path to a policy JSON override file for `PolicyEngine` | — |
 | `--auto-install` | Attempt `apt install` of missing tools (Kali Linux only) | off |
-| `--dry-run` | Show targets, tools, and execution plan without running anything | off |
+| `--dry-run` | Show targets, tools, and execution plan without running anything (skips acknowledgement) | off |
+| `--no-ack` | Skip interactive acknowledgement prompt (requires `RECON_UNATTENDED=1` env var) | off |
 | `--verbose`, `-v` | Print full tracebacks on unexpected errors | off |
 
 ## Supported Target Formats
@@ -99,12 +100,20 @@ Together these ensure that (a) the target list has not been tampered with, and (
 
 | File | Purpose |
 |---|---|
-| `scope_utils.py` | Shared canonicalization, HMAC signing, and scope validation logic |
-| `attack-surface-mapper.py` | Main recon orchestrator |
+| `attack_surface_mapper.py` | Main recon orchestrator |
 | `create_scope.py` | CLI helper to create/sign scope files |
+| `scope_utils.py` | Shared canonicalization, HMAC signing, and scope validation logic |
 | `external_tools.json` | Authoritative tool-to-depth mapping |
+| `pyproject.toml` | Build metadata and pinned dependencies |
+| `requirements.txt` | Pip convenience mirror of pyproject.toml deps |
+| `README.md` | Primary project documentation |
+| `Quickstart.md` | Step-by-step setup and usage guide |
+| `signed_scope_howto.md` | Detailed walkthrough of scope signing workflow |
+| `one-liner-scope-creation.md` | Single-command scope creation snippet |
+| `pre-commit-hook.sh` | Git hook to prevent committing .pyc files |
+| `tests/test_attack_surface_mapper.py` | Unit and integration test suite |
 
-All entry points (`attack-surface-mapper.py`, `create_scope.py`, doc snippets) import canonicalization from `scope_utils.py` to guarantee identical behavior.
+All entry points (`attack_surface_mapper.py`, `create_scope.py`, doc snippets) import canonicalization from `scope_utils.py` to guarantee identical behavior.
 
 ## External Tool Dependencies
 
@@ -113,7 +122,7 @@ The recon engine calls external binaries. See `external_tools.json` for the expe
 Auto-install on Kali-like systems:
 
 ```bash
-python3 attack-surface-mapper.py example.com --scope-file scope.json --auto-install
+python3 attack_surface_mapper.py example.com --scope-file scope.json --auto-install
 ```
 
 ## Output Artifacts
@@ -128,3 +137,31 @@ All outputs are written to the directory specified by `--output-dir`.
 | `recon.log` | Structured JSON log | Append-only structured log (one JSON object per line) from `structlog`. |
 | `spans.jsonl` | JSON Lines | OpenTelemetry trace spans. |
 | `raw_<target>_<tool>.txt` | Plain text | Raw stdout captured from each tool execution. |
+
+## Development
+
+```bash
+make setup      # Create venv, install deps + dev tools, install pre-commit hook
+make test       # Run pytest
+make lint       # Run ruff
+make typecheck  # Run mypy --strict
+make ci         # Run all three in order (same as CI pipeline)
+make clean      # Remove caches, venvs, output dirs
+```
+
+CI runs automatically on push/PR via GitHub Actions across Python 3.10–3.13.
+
+### Automated / CI Scanning
+
+For unattended pipelines where no human is present to type the acknowledgement string:
+
+```bash
+export RECON_SCOPE_SECRET="your-secret-min-16-chars"
+export RECON_UNATTENDED=1
+python3 attack_surface_mapper.py example.com \
+  --scope-file scope.json \
+  --depth passive \
+  --no-ack
+```
+
+Both `RECON_UNATTENDED=1` **and** `--no-ack` are required — this prevents accidental unattended scans while enabling automation when explicitly configured.

@@ -40,6 +40,11 @@ def main():
         nargs="*",
         help="Target domains, IPs, or CIDRs. If omitted, uses the built-in example list.",
     )
+    parser.add_argument(
+        "--force", "-y",
+        action="store_true",
+        help="Overwrite existing scope file without prompting.",
+    )
     args = parser.parse_args()
 
     print("=== Recon Agent - Create Signed Scope (v3.4.0) ===\n")
@@ -94,6 +99,12 @@ def main():
     }
 
     output_path = Path(args.output)
+    if output_path.exists() and not args.force:
+        answer = input(f"\n⚠  {output_path} already exists. Overwrite? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("Aborted.")
+            sys.exit(0)
+
     output_path.write_text(json.dumps(scope_data, indent=2), encoding="utf-8")
 
     print(f"\n✅ {output_path} created successfully!")
