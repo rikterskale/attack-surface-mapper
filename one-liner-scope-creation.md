@@ -1,10 +1,8 @@
-﻿### `one-liner-scope-creation.md`
-```markdown
-## One-liner signed scope creation
+﻿## One-liner signed scope creation
 
 Run this command and edit the `targets` list inline before executing:
 
-```bash
+```
 python3 -c '
 import json, hashlib, hmac, sys
 print("=== Signed Scope Creator ===\n")
@@ -19,4 +17,5 @@ with open("scope.json", "w", encoding="utf-8") as f:
     json.dump({"allowed_targets": targets, "signature": signature}, f, indent=2)
 print("scope.json created")
 '
-Keep the secret safe; you need it as RECON_SCOPE_SECRET (or --scope-secret) when running the scanner.
+```
+## Keep the secret safe; you need it as RECON_SCOPE_SECRET (or --scope-secret) when running the scanner.
