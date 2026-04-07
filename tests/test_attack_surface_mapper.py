@@ -110,9 +110,12 @@ class CLIMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             with patch.object(sys, "argv", args), \
                  patch.object(asm.ScopeValidator, "runtime_acknowledgement", return_value=None):
-                with self.assertRaises(SystemExit) as ctx:
-                    await asm.main()
-                self.assertEqual(ctx.exception.code, 1)
+                try:
+                    with self.assertRaises(SystemExit) as ctx:
+                        await asm.main()
+                    self.assertEqual(ctx.exception.code, 1)
+                finally:
+                    asm._configure_logger()
 
     async def test_main_exits_on_missing_targets_file(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -133,9 +136,12 @@ class CLIMainIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
             with patch.object(sys, "argv", args), \
                  patch.object(asm.ScopeValidator, "runtime_acknowledgement", return_value=None):
-                with self.assertRaises(SystemExit) as ctx:
-                    await asm.main()
-                self.assertEqual(ctx.exception.code, 1)
+                try:
+                    with self.assertRaises(SystemExit) as ctx:
+                        await asm.main()
+                    self.assertEqual(ctx.exception.code, 1)
+                finally:
+                    asm._configure_logger()
 
 
 class ExportTests(unittest.TestCase):
