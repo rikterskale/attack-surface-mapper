@@ -115,13 +115,13 @@ Key flags:
 
 ## 6. Output Directory Structure
 ### textresults/example.com/
-   ### ├── findings.db          # SQLite database
-   ### ├── findings.jsonl       # Machine-readable line-by-line findings
-   ### ├── findings.csv         # Spreadsheet-friendly export
-   ### ├── recon.log            # Structured JSON logs
-   ### ├── raw_example.com_amass.txt
-   ### ├── raw_example.com_nuclei.txt
-   ### └── ... (one raw file per tool)
+   ### ── findings.db          # SQLite database
+   ### ── findings.jsonl       # Machine-readable line-by-line findings
+   ### ── findings.csv         # Spreadsheet-friendly export
+   ### ── recon.log            # Structured JSON logs
+   ### ── raw_example.com_amass.txt
+   ### ── raw_example.com_nuclei.txt
+   ### ── ... (one raw file per tool)
 
 ## 7. Troubleshooting & Common Issues
 
