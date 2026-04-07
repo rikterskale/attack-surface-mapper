@@ -1,97 +1,53 @@
-﻿## How to Use Signed Scope in the Recon Agent
+﻿### `signed_scope_howto.md`
+```markdown
+## Using Signed Scope in Attack Surface Mapper
 
-### Why Signed Scope Exists
-The signed scope is a security guardrail. It forces you to explicitly list every target you are allowed to scan and cryptographically sign that list. This prevents accidental or unauthorized scans.
+Signed scope is the authorization guardrail. The scanner only runs against targets listed in `scope.json` that has a valid HMAC signature.
 
-### Step 1: Create Your Signed scope.json
+### Step 1: Create `scope.json`
 
-1.  Save the script below as create_scope.py:
-```
-#!/usr/bin/env python3
-import json
-import hashlib
-import hmac
-import sys
+Use the bundled helper:
 
-print("=== Recon Agent - Create Signed Scope ===\n")
+```bash
+python3 create_scope.py
+Or create it manually:
 
-=== EDIT THIS LIST ===
+import json, hashlib, hmac
+
 targets = [
     "example.com",
     "api.example.com",
-    "test.example.com",
-    "192.168.1.0/24",      # CIDR ranges are supported
-    # Add as many domains, IPs, or CIDRs as needed
+    "192.168.1.0/24",
 ]
+secret = "replace-with-strong-secret"
 
-secret = input("Enter a strong secret key (keep this safe!): ").strip()
-if len(secret) < 8:
-    print("Secret must be at least 8 characters.")
-    sys.exit(1)
-
-Create payload and HMAC signature
 payload = json.dumps({"allowed_targets": targets}, sort_keys=True).encode("utf-8")
 signature = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
-scope_data = {
-    "allowed_targets": targets,
-    "signature": signature
-}
-
 with open("scope.json", "w", encoding="utf-8") as f:
-    json.dump(scope_data, f, indent=2)
-
-print("\nscope.json created successfully!")
-print(f"   Targets authorized: {len(targets)}")
-print(f"   Signature: {signature[:16]}... (full signature saved in file)")
-print("\nKeep your secret key safe — you'll need it to run the agent.")
-```
-
-2.  Run It:
-```
-python3 create_scope.py
-```
-
-## Step 2: Run the Recon Agent with the Signed Scope
-Basic command:
-```
-python3 recon_agent.py example.com \
+    json.dump({"allowed_targets": targets, "signature": signature}, f, indent=2)
+Step 2: Run the scanner
+export RECON_SCOPE_SECRET="your-secret"
+python3 attack-surface-mapper.py example.com \
   --scope-file scope.json \
-  --scope-secret "your-secret-key-here" \
-  --depth deep \
+  --depth standard \
   --output-dir results/example.com
-  ```
-
-
-## Recommended (more secure — secret never in shell history):
-```
-export RECON_SCOPE_SECRET="your-secret-key-here"
-python3 recon_agent.py example.com \
+Step 3: Optional scope update from file
+python3 attack-surface-mapper.py --file targets.txt \
   --scope-file scope.json \
-  --depth deep \
-  --output-dir results/example.com
-```
+  --update-scope \
+  --depth passive
+--update-scope will:
 
-## Scan multiple targets from a file:
+read targets from --file
 
-```python3 recon_agent.py --file targets.txt \
-  --scope-file scope.json \
-  --depth standard
-```
+canonicalize/validate each target
 
-## What Happens When You Run It
+merge valid entries into scope.json
 
-The script verifies the HMAC signature in scope.json.
-It checks that your target(s) are in the allowed_targets list.
+re-sign the scope with the same secret
 
-It shows the runtime acknowledgement prompt:
+Invalid targets are skipped and logged.
 
-!!!!!!!!!!!!!!!!!!!!!!!!!!!
-EXPLICIT AUTHORIZATION REQUIRED
-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
-Type exactly: ""I ACKNOWLEDGE THIS SCAN IS AUTHORIZED AND WITHIN SCOPE""
-
-→You must type that exact phrase to continue.
-
-### If everything passes, the scan starts.
+---

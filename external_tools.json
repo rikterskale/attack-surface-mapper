@@ -1,0 +1,5 @@
+{
+  "passive": [ "amass", "subfinder", "assetfinder", "knockpy", "theharvester", "sherlock" ],
+  "standard": [ "nmap", "rustscan", "naabu", "whatweb", "httpx", "httprobe" ],
+  "deep": [ "nuclei", "nikto", "gobuster", "feroxbuster", "dirsearch" ]
+}

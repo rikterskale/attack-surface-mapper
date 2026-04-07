@@ -14,8 +14,10 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -23,9 +25,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from urllib.parse import urlparse
 
 import structlog
-import tqdm
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
@@ -126,17 +128,27 @@ class PolicyEngine:
 # ========================== SCOPE VALIDATOR (with enhanced error logging) ==========================
 class ScopeValidator:
     @staticmethod
+    def _validate_scope_schema(data: Dict[str, Any]) -> List[str]:
+        targets = data.get("allowed_targets")
+        signature = data.get("signature")
+
+        if not isinstance(targets, list):
+            raise ValueError("Scope file must contain 'allowed_targets' as a list")
+        if not all(isinstance(t, str) for t in targets):
+            raise ValueError("All entries in 'allowed_targets' must be strings")
+        if not isinstance(signature, str) or not signature.strip():
+            raise ValueError("Scope file missing signature")
+        return targets
+
+    @staticmethod
     def verify_signed_scope(scope_file: str, secret: str) -> List[str]:
         path = Path(scope_file)
         if not path.exists():
             raise FileNotFoundError(f"Scope file {scope_file} not found")
 
         data = json.loads(path.read_text())
-        targets = data.get("allowed_targets", [])
-        signature = data.get("signature")
-
-        if not signature:
-            raise ValueError("Scope file missing signature")
+        targets = ScopeValidator._validate_scope_schema(data)
+        signature = data["signature"]
 
         payload = json.dumps({"allowed_targets": targets}, sort_keys=True).encode()
         expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
@@ -158,7 +170,7 @@ class ScopeValidator:
         try:
             if path.exists():
                 data = json.loads(path.read_text())
-                existing = set(data.get("allowed_targets", []))
+                existing = set(ScopeValidator._validate_scope_schema(data))
             else:
                 existing = set()
 
@@ -198,8 +210,13 @@ class ScopeValidator:
 def parse_and_canonicalize_target(target: str) -> str:
     target = target.strip().lower()
     if "://" in target:
-        target = target.split("://", 1)[1]
-    target = target.rstrip("/")
+        parsed = urlparse(target)
+        target = parsed.netloc or parsed.path
+    target = target.rstrip("/").split("/", 1)[0]
+    if ":" in target and not target.startswith("["):
+        host, port = target.rsplit(":", 1)
+        if port.isdigit():
+            target = host
 
     try:
         ipaddress.ip_address(target)
@@ -212,10 +229,15 @@ def parse_and_canonicalize_target(target: str) -> str:
     except ValueError:
         pass
 
-    domain_regex = r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)\.(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.[A-Za-z]{2,})?$"
+    domain_regex = r"^(?=.{1,253}$)(?:(?!-)[a-z0-9-]{1,63}(?<!-)\.)+[a-z]{2,63}$"
     if re.match(domain_regex, target):
         return target
     raise ValueError(f"Invalid target format: {target}")
+
+
+def sanitize_filename_fragment(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]", "_", value.strip())
+    return sanitized or "unknown_target"
 
 
 # ========================== CORRELATION ENGINE ==========================
@@ -263,11 +285,14 @@ class Tool:
             return []
 
         async with semaphore:
-            cmd = self.cmd_template.format(target=target, wordlist=DEFAULT_WORDLIST)
+            shell_target = shlex.quote(target)
+            shell_wordlist = shlex.quote(DEFAULT_WORDLIST)
+            cmd = self.cmd_template.format(target=shell_target, wordlist=shell_wordlist)
             if self.extra_flags:
                 cmd += f" {self.extra_flags}"
 
-            raw_path = output_dir / f"raw_{target}_{self.name}.txt"
+            raw_target = sanitize_filename_fragment(target)
+            raw_path = output_dir / f"raw_{raw_target}_{self.name}.txt"
 
             for attempt in range(retries + 1):
                 with tracer.start_as_current_span(f"tool.{self.name}") as span:
@@ -312,6 +337,25 @@ class ToolRegistry:
     def __init__(self, policy: PolicyEngine):
         self.tools: Dict[str, Tool] = {}
         self.policy = policy
+        self.package_map: Dict[str, str] = {
+            "amass": "amass",
+            "subfinder": "subfinder",
+            "assetfinder": "assetfinder",
+            "knockpy": "knockpy",
+            "theharvester": "theharvester",
+            "sherlock": "sherlock",
+            "nmap": "nmap",
+            "rustscan": "rustscan",
+            "naabu": "naabu",
+            "whatweb": "whatweb",
+            "httpx": "httpx-toolkit",
+            "httprobe": "httprobe",
+            "nuclei": "nuclei",
+            "nikto": "nikto",
+            "gobuster": "gobuster",
+            "feroxbuster": "feroxbuster",
+            "dirsearch": "dirsearch",
+        }
 
         # Passive
         self.register("amass", "amass enum -d {target} -o /dev/stdout -silent")
@@ -347,6 +391,32 @@ class ToolRegistry:
 
     def get_allowed_tools(self, depth: str) -> List[str]:
         return [t for t in self.tools if self.policy.is_tool_allowed(t, depth)]
+
+    def get_missing_tools(self, depth: str) -> List[str]:
+        return [t for t in self.get_allowed_tools(depth) if not self.tools[t].is_installed()]
+
+    def auto_install_missing(self, depth: str) -> List[str]:
+        missing = self.get_missing_tools(depth)
+        if not missing:
+            return []
+        if not IS_KALI:
+            logger.warning("auto_install_unsupported_platform", platform=platform.platform(), missing=missing)
+            return missing
+
+        apt = shutil.which("apt-get") or shutil.which("apt")
+        if not apt:
+            logger.warning("auto_install_missing_package_manager", missing=missing)
+            return missing
+
+        packages = sorted({self.package_map.get(tool, tool) for tool in missing})
+        cmd = [apt, "install", "-y", *packages]
+        try:
+            logger.info("auto_install_start", packages=packages, command=" ".join(cmd))
+            subprocess.run(cmd, check=True)
+        except Exception as e:
+            logger.error("auto_install_failed", error=str(e), packages=packages)
+            return self.get_missing_tools(depth)
+        return self.get_missing_tools(depth)
 
 
 # ========================== SQLITE DB ==========================
@@ -410,7 +480,9 @@ class ReconAgentRun:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
 
                     for res in results:
-                        if isinstance(res, list):
+                        if isinstance(res, Exception):
+                            errors.append(f"{target}: {type(res).__name__}: {res}")
+                        elif isinstance(res, list):
                             for f in res:
                                 self.correlator.add_finding(f)
                                 self.db.add_finding(f.model_dump())
@@ -465,7 +537,8 @@ def parse_args():
     parser.add_argument("--scope-secret", help="Secret (or use RECON_SCOPE_SECRET env var)")
     parser.add_argument("--update-scope", action="store_true", help="Auto-merge targets.txt into scope.json and re-sign")
     parser.add_argument("--policy", help="Policy JSON file")
-    parser.add_argument("--auto-install", action="store_true")
+    parser.add_argument("--auto-install", action="store_true",
+                        help="Attempt apt-based install of missing tools on Kali Linux")
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser.parse_args()
 
@@ -543,6 +616,12 @@ async def main():
     # ====================== Normal flow continues ======================
     ScopeValidator.runtime_acknowledgement()
     allowed_targets = ScopeValidator.verify_signed_scope(args.scope_file, secret)
+    canonical_allowed = set()
+    for allowed in allowed_targets:
+        try:
+            canonical_allowed.add(parse_and_canonicalize_target(allowed))
+        except ValueError:
+            logger.warning("invalid_allowed_target_in_scope", target=allowed)
 
     # Load and filter targets
     targets = []
@@ -552,7 +631,7 @@ async def main():
         targets.extend([parse_and_canonicalize_target(line) for line in
                         Path(args.file).read_text(encoding="utf-8").splitlines() if line.strip()])
 
-    targets = [t for t in targets if t in allowed_targets]
+    targets = [t for t in targets if t in canonical_allowed]
     if not targets:
         logger.error("no_valid_targets_in_scope")
         sys.exit(1)
@@ -560,6 +639,14 @@ async def main():
     # Policy & Registry
     policy = PolicyEngine(args.policy)
     registry = ToolRegistry(policy)
+    if args.auto_install:
+        remaining_missing = registry.auto_install_missing(args.depth)
+        if remaining_missing:
+            logger.warning("tools_still_missing_after_auto_install", tools=remaining_missing)
+
+    missing_tools = registry.get_missing_tools(args.depth)
+    if missing_tools:
+        logger.warning("missing_tools", depth=args.depth, tools=missing_tools)
 
     db = SQLiteDB(output_dir / "findings.db")
     semaphore = asyncio.Semaphore(args.threads)

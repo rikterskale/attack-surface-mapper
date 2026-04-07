@@ -2,6 +2,8 @@
 import json
 import hashlib
 import hmac
+import ipaddress
+import re
 import sys
 
 print("=== Recon Agent - Create Signed Scope ===\n")
@@ -19,6 +21,23 @@ secret = input("Enter a strong secret key (keep this safe!): ").strip()
 if len(secret) < 8:
     print("❌ Secret must be at least 8 characters.")
     sys.exit(1)
+
+domain_regex = r"^(?=.{1,253}$)(?:(?!-)[a-z0-9-]{1,63}(?<!-)\.)+[a-z]{2,63}$"
+for target in targets:
+    candidate = target.strip().lower()
+    try:
+        ipaddress.ip_address(candidate)
+        continue
+    except ValueError:
+        pass
+    try:
+        ipaddress.ip_network(candidate, strict=False)
+        continue
+    except ValueError:
+        pass
+    if not re.match(domain_regex, candidate):
+        print(f"❌ Invalid target in default list: {target}")
+        sys.exit(1)
 
 # Create the payload and HMAC signature
 payload = json.dumps({"allowed_targets": targets}, sort_keys=True).encode("utf-8")
