@@ -37,6 +37,7 @@ The recon engine calls external binaries (for example: nmap, amass, subfinder, n
 See external_tools.json for expected tools by scan depth.
 
 You can optionally use:
+
 ```
 python3 attack-surface-mapper.py example.com --scope-file scope.json --auto-install
 (works only on Kali-like apt environments).
@@ -51,4 +52,4 @@ findings.csv
 
 recon.log
 
-raw_<target>_<tool>.txt files per tool
+raw\_<target>\_<tool>.txt files per tool
