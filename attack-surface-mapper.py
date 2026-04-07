@@ -249,6 +249,19 @@ def sanitize_filename_fragment(value: str) -> str:
     return sanitized or "unknown_target"
 
 
+def parse_targets_from_lines(lines: List[str]) -> Tuple[List[str], List[str]]:
+    valid_targets: List[str] = []
+    invalid_targets: List[str] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            valid_targets.append(parse_and_canonicalize_target(line))
+        except ValueError:
+            invalid_targets.append(line.strip())
+    return valid_targets, invalid_targets
+
+
 class CorrelationEngine:
     def __init__(self):
         self.findings: List[Finding] = []
@@ -704,15 +717,7 @@ async def main():
         logger.info("scope_update_attempted", scope_file=args.scope_file, targets_file=args.file)
         try:
             raw_lines = Path(args.file).read_text(encoding="utf-8").splitlines()
-            valid_targets: List[str] = []
-            invalid_targets: List[str] = []
-
-            for line in raw_lines:
-                if line.strip():
-                    try:
-                        valid_targets.append(parse_and_canonicalize_target(line))
-                    except ValueError:
-                        invalid_targets.append(line.strip())
+            valid_targets, invalid_targets = parse_targets_from_lines(raw_lines)
 
             if invalid_targets:
                 logger.warning("invalid_targets_skipped", count=len(invalid_targets), examples=invalid_targets[:5])
@@ -755,15 +760,24 @@ async def main():
 
     targets: List[str] = []
     if args.target:
-        targets.append(parse_and_canonicalize_target(args.target))
+        try:
+            targets.append(parse_and_canonicalize_target(args.target))
+        except ValueError as e:
+            logger.error("invalid_cli_target", target=args.target, error=str(e))
+            print(f"❌ Error: Invalid target '{args.target}': {e}")
+            sys.exit(1)
     if args.file:
-        targets.extend(
-            [
-                parse_and_canonicalize_target(line)
-                for line in Path(args.file).read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-        )
+        try:
+            raw_lines = Path(args.file).read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            logger.error("targets_file_not_found", file=args.file)
+            print(f"❌ Error: Targets file '{args.file}' not found.")
+            sys.exit(1)
+
+        valid_targets, invalid_targets = parse_targets_from_lines(raw_lines)
+        if invalid_targets:
+            logger.warning("invalid_targets_skipped", count=len(invalid_targets), examples=invalid_targets[:5])
+        targets.extend(valid_targets)
 
     targets = [t for t in targets if t in canonical_allowed]
     if not targets:

@@ -42,6 +42,13 @@ class TargetParsingTests(unittest.TestCase):
         cleaned = asm.sanitize_filename_fragment("2001:db8::1")
         self.assertNotIn(":", cleaned)
 
+    def test_parse_targets_from_lines_splits_valid_and_invalid(self):
+        valid, invalid = asm.parse_targets_from_lines(
+            ["https://api.example.com:443/path", "bad target", "10.0.0.1", ""]
+        )
+        self.assertEqual(valid, ["api.example.com", "10.0.0.1"])
+        self.assertEqual(invalid, ["bad target"])
+
 
 class CorrelationTests(unittest.TestCase):
     def test_dedup_then_correlate(self):
