@@ -1,7 +1,6 @@
 ﻿#!/usr/bin/env python3
 """
-Safe Standalone Recon Agent - Enterprise Edition (v3.2)
-Full single-file version with enhanced --update-scope error logging
+Safe Standalone Recon Agent - Enterprise Edition (v3.3)
 """
 
 import argparse
@@ -14,13 +13,13 @@ import json
 import os
 import platform
 import re
-import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -33,25 +32,40 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 from pydantic import BaseModel, Field
 
-# ========================== PLATFORM ==========================
 IS_WINDOWS = platform.system() == "Windows"
-IS_KALI = shutil.which("apt") and "kali" in platform.platform().lower()
+IS_KALI = bool(shutil.which("apt")) and "kali" in platform.platform().lower()
 
 DEFAULT_WORDLIST = (
     "/usr/share/wordlists/dirb/common.txt" if IS_KALI
     else str(Path.home() / "wordlists" / "common.txt")
 )
 
-# ========================== STRUCTURED LOGGING + TRACING ==========================
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.JSONRenderer(),
-    ],
-    logger_factory=structlog.PrintLoggerFactory(),
-)
+_LOG_FILE_HANDLE = None
+
+
+def _configure_logger(log_path: Path | None = None):
+    global _LOG_FILE_HANDLE
+    if _LOG_FILE_HANDLE:
+        _LOG_FILE_HANDLE.close()
+        _LOG_FILE_HANDLE = None
+
+    logger_factory = structlog.PrintLoggerFactory()
+    if log_path:
+        _LOG_FILE_HANDLE = open(log_path, "a", encoding="utf-8")
+        logger_factory = structlog.WriteLoggerFactory(file=_LOG_FILE_HANDLE)
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer(),
+        ],
+        logger_factory=logger_factory,
+    )
+
+
+_configure_logger()
 logger = structlog.get_logger("recon_agent")
 
 trace.set_tracer_provider(TracerProvider())
@@ -60,7 +74,6 @@ tracer_provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
 tracer = trace.get_tracer(__name__)
 
 
-# ========================== TYPED FINDING SCHEMA ==========================
 class Finding(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     tool: str
@@ -75,7 +88,6 @@ class Finding(BaseModel):
     correlated_to: List[str] = Field(default_factory=list)
 
 
-# ========================== STATE MACHINE ==========================
 from enum import Enum
 
 
@@ -101,7 +113,6 @@ class RunStateMachine:
         logger.info("state_transition", old_state=old.value, new_state=new_state.value)
 
 
-# ========================== POLICY ENGINE ==========================
 class PolicyEngine:
     def __init__(self, policy_path: str | None = None):
         self.policy: Dict = {
@@ -115,7 +126,7 @@ class PolicyEngine:
         }
         if policy_path and Path(policy_path).exists():
             try:
-                with open(policy_path) as f:
+                with open(policy_path, encoding="utf-8") as f:
                     self.policy.update(json.load(f))
                 logger.info("policy_loaded", path=policy_path)
             except Exception as e:
@@ -125,7 +136,6 @@ class PolicyEngine:
         return tool in self.policy["allowed_tools"].get(depth, [])
 
 
-# ========================== SCOPE VALIDATOR (with enhanced error logging) ==========================
 class ScopeValidator:
     @staticmethod
     def _validate_scope_schema(data: Dict[str, Any]) -> List[str]:
@@ -146,7 +156,7 @@ class ScopeValidator:
         if not path.exists():
             raise FileNotFoundError(f"Scope file {scope_file} not found")
 
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
         targets = ScopeValidator._validate_scope_schema(data)
         signature = data["signature"]
 
@@ -161,15 +171,12 @@ class ScopeValidator:
 
     @staticmethod
     def update_and_resign(scope_file: str, new_targets: List[str], secret: str):
-        """Enhanced version with detailed error logging"""
-        logger.info("scope_update_starting",
-                    scope_file=scope_file,
-                    new_targets_provided=len(new_targets))
+        logger.info("scope_update_starting", scope_file=scope_file, new_targets_provided=len(new_targets))
 
         path = Path(scope_file)
         try:
             if path.exists():
-                data = json.loads(path.read_text())
+                data = json.loads(path.read_text(encoding="utf-8"))
                 existing = set(ScopeValidator._validate_scope_schema(data))
             else:
                 existing = set()
@@ -179,19 +186,21 @@ class ScopeValidator:
             signature = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
             updated = {"allowed_targets": merged, "signature": signature}
-            path.write_text(json.dumps(updated, indent=2))
+            path.write_text(json.dumps(updated, indent=2), encoding="utf-8")
 
-            new_added = len(merged) - len(existing)
-            logger.info("scope_update_success",
-                        new_targets_added=new_added,
-                        total_targets=len(merged),
-                        scope_file=scope_file)
-
+            logger.info(
+                "scope_update_success",
+                new_targets_added=len(merged) - len(existing),
+                total_targets=len(merged),
+                scope_file=scope_file,
+            )
         except Exception as e:
-            logger.exception("scope_update_failed",
-                             scope_file=scope_file,
-                             error_type=type(e).__name__,
-                             error=str(e))
+            logger.exception(
+                "scope_update_failed",
+                scope_file=scope_file,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
             raise
 
     @staticmethod
@@ -206,7 +215,6 @@ class ScopeValidator:
         logger.info("runtime_acknowledgement_passed")
 
 
-# ========================== TARGET PARSER ==========================
 def parse_and_canonicalize_target(target: str) -> str:
     target = target.strip().lower()
     if "://" in target:
@@ -223,6 +231,7 @@ def parse_and_canonicalize_target(target: str) -> str:
         return target
     except ValueError:
         pass
+
     try:
         ipaddress.ip_network(target, strict=False)
         return target
@@ -240,19 +249,16 @@ def sanitize_filename_fragment(value: str) -> str:
     return sanitized or "unknown_target"
 
 
-# ========================== CORRELATION ENGINE ==========================
 class CorrelationEngine:
     def __init__(self):
         self.findings: List[Finding] = []
-        self.asset_map: Dict[str, List[str]] = {}
 
     def add_finding(self, finding: Finding):
         self.findings.append(finding)
-        self.asset_map.setdefault(finding.asset, []).append(finding.id)
 
     def deduplicate(self) -> List[Finding]:
         seen: set[tuple] = set()
-        unique = []
+        unique: List[Finding] = []
         for f in self.findings:
             key = (f.tool, f.asset, f.indicator, f.severity)
             if key not in seen:
@@ -260,37 +266,51 @@ class CorrelationEngine:
                 unique.append(f)
         return unique
 
-    def correlate(self) -> List[Finding]:
-        for f in self.findings:
+    @staticmethod
+    def correlate(findings: List[Finding]) -> List[Finding]:
+        asset_map: Dict[str, List[str]] = {}
+        for f in findings:
+            asset_map.setdefault(f.asset, []).append(f.id)
+
+        for f in findings:
             if f.type == "vulnerability":
-                for rid in self.asset_map.get(f.asset, []):
-                    if rid != f.id:
-                        f.correlated_to.append(rid)
-        return self.findings
+                f.correlated_to = [fid for fid in asset_map.get(f.asset, []) if fid != f.id]
+        return findings
 
 
-# ========================== TOOL ==========================
 class Tool:
-    def __init__(self, name: str, cmd_template: str, timeout: int = 180):
+    def __init__(
+        self,
+        name: str,
+        cmd_template: List[str],
+        timeout: int = 180,
+        stdin_target: bool = False,
+    ):
         self.name = name
         self.cmd_template = cmd_template
         self.timeout = timeout
-        self.extra_flags = ""
+        self.stdin_target = stdin_target
+        self.extra_flags: List[str] = []
 
     def is_installed(self) -> bool:
         return shutil.which(self.name) is not None
 
-    async def execute(self, target: str, semaphore: asyncio.Semaphore, output_dir: Path, retries: int = 2) -> List[Finding]:
+    def _build_command(self, target: str) -> List[str]:
+        command = [part.format(target=target, wordlist=DEFAULT_WORDLIST) for part in self.cmd_template]
+        return command + self.extra_flags
+
+    async def execute(
+        self,
+        target: str,
+        semaphore: asyncio.Semaphore,
+        output_dir: Path,
+        retries: int = 2,
+    ) -> List[Finding]:
         if not self.is_installed():
             return []
 
         async with semaphore:
-            shell_target = shlex.quote(target)
-            shell_wordlist = shlex.quote(DEFAULT_WORDLIST)
-            cmd = self.cmd_template.format(target=shell_target, wordlist=shell_wordlist)
-            if self.extra_flags:
-                cmd += f" {self.extra_flags}"
-
+            cmd = self._build_command(target)
             raw_target = sanitize_filename_fragment(target)
             raw_path = output_dir / f"raw_{raw_target}_{self.name}.txt"
 
@@ -299,12 +319,22 @@ class Tool:
                     span.set_attribute("tool", self.name)
                     span.set_attribute("target", target)
                     try:
-                        proc = await asyncio.create_subprocess_shell(
-                            cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdin=asyncio.subprocess.PIPE if self.stdin_target else None,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
                         )
-                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
+
+                        input_bytes = (target + "\n").encode("utf-8") if self.stdin_target else None
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(input=input_bytes), timeout=self.timeout)
                         output = stdout.decode(errors="ignore").strip()
+                        err_output = stderr.decode(errors="ignore").strip()
+
                         raw_path.write_text(output, encoding="utf-8")
+
+                        if proc.returncode not in (0, None) and not output:
+                            raise RuntimeError(err_output or f"{self.name} exited with code {proc.returncode}")
 
                         findings = self._parse_output(output, target)
                         logger.info("tool_complete", tool=self.name, target=target, findings=len(findings))
@@ -320,19 +350,119 @@ class Tool:
                             return []
                         await asyncio.sleep(2 ** attempt)
 
+            return []
+
     def _parse_output(self, output: str, target: str) -> List[Finding]:
+        if not output.strip():
+            return []
+
+        parsers = {
+            "subfinder": self._parse_json_lines,
+            "httpx": self._parse_json_lines,
+            "naabu": self._parse_json_lines,
+            "nuclei": self._parse_json_lines,
+            "nmap": self._parse_nmap_xml,
+        }
+        parser = parsers.get(self.name, self._parse_generic_lines)
+        return parser(output, target)
+
+    def _parse_generic_lines(self, output: str, target: str) -> List[Finding]:
         lines = [line.strip() for line in output.splitlines() if line.strip()]
-        return [Finding(
-            tool=self.name,
-            asset=target,
-            indicator=line[:100],
-            value=line,
-            type="generic",
-            severity="info"
-        ) for line in lines]
+        return [
+            Finding(
+                tool=self.name,
+                asset=target,
+                indicator=line[:100],
+                value=line,
+                type="generic",
+                severity="info",
+            )
+            for line in lines
+        ]
+
+    def _parse_json_lines(self, output: str, target: str) -> List[Finding]:
+        findings: List[Finding] = []
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            if self.name == "nuclei":
+                matched_at = obj.get("matched-at") or obj.get("host") or target
+                info = obj.get("info", {})
+                severity = str(info.get("severity", "info")).lower()
+                finding_type = "vulnerability"
+                indicator = obj.get("template-id") or obj.get("matcher-name") or "nuclei_finding"
+                value = json.dumps(obj, ensure_ascii=False)
+            elif self.name == "subfinder":
+                matched_at = obj.get("host") or obj.get("input") or target
+                severity = "info"
+                finding_type = "subdomain"
+                indicator = "subdomain"
+                value = matched_at
+            elif self.name == "httpx":
+                matched_at = obj.get("url") or obj.get("host") or target
+                severity = "info"
+                finding_type = "web_service"
+                indicator = f"http_{obj.get('status-code', 'unknown')}"
+                value = json.dumps(obj, ensure_ascii=False)
+            else:  # naabu
+                host = obj.get("host") or target
+                port = obj.get("port")
+                matched_at = host
+                severity = "info"
+                finding_type = "open_port"
+                indicator = f"port_{port}" if port is not None else "open_port"
+                value = json.dumps(obj, ensure_ascii=False)
+
+            findings.append(
+                Finding(
+                    tool=self.name,
+                    asset=str(matched_at),
+                    indicator=str(indicator),
+                    value=str(value),
+                    type=finding_type,
+                    severity=severity,
+                    source_raw=line,
+                )
+            )
+        return findings
+
+    def _parse_nmap_xml(self, output: str, target: str) -> List[Finding]:
+        findings: List[Finding] = []
+        try:
+            root = ET.fromstring(output)
+        except ET.ParseError:
+            return self._parse_generic_lines(output, target)
+
+        for host in root.findall("host"):
+            addr_elem = host.find("address")
+            host_addr = addr_elem.get("addr") if addr_elem is not None else target
+            for port in host.findall("./ports/port"):
+                state_elem = port.find("state")
+                if state_elem is None or state_elem.get("state") != "open":
+                    continue
+                port_id = port.get("portid", "unknown")
+                proto = port.get("protocol", "tcp")
+                svc_elem = port.find("service")
+                svc_name = svc_elem.get("name") if svc_elem is not None else "unknown"
+                findings.append(
+                    Finding(
+                        tool=self.name,
+                        asset=str(host_addr),
+                        indicator=f"open_{proto}_{port_id}",
+                        value=f"open {proto}/{port_id} service={svc_name}",
+                        type="open_port",
+                        severity="info",
+                    )
+                )
+        return findings
 
 
-# ========================== TOOL REGISTRY ==========================
 class ToolRegistry:
     def __init__(self, policy: PolicyEngine):
         self.tools: Dict[str, Tool] = {}
@@ -357,37 +487,31 @@ class ToolRegistry:
             "dirsearch": "dirsearch",
         }
 
-        # Passive
-        self.register("amass", "amass enum -d {target} -o /dev/stdout -silent")
-        self.register("subfinder", "subfinder -d {target} -silent -json")
-        self.register("assetfinder", "assetfinder --subs-only {target}")
-        self.register("knockpy", "knockpy {target} --no-color")
+        self.register("amass", ["amass", "enum", "-d", "{target}", "-o", "/dev/stdout", "-silent"])
+        self.register("subfinder", ["subfinder", "-d", "{target}", "-silent", "-json"])
+        self.register("assetfinder", ["assetfinder", "--subs-only", "{target}"])
+        self.register("knockpy", ["knockpy", "{target}", "--no-color"])
 
-        # OSINT
-        self.register("theharvester", "theHarvester -d {target} -b all -l 500")
-        self.register("sherlock", "sherlock {target} --timeout 10 --print-found")
+        self.register("theharvester", ["theHarvester", "-d", "{target}", "-b", "all", "-l", "500"])
+        self.register("sherlock", ["sherlock", "{target}", "--timeout", "10", "--print-found"])
 
-        # Port scan
-        self.register("nmap", "nmap -T4 -F --open -oX - {target}")
-        self.register("rustscan", "rustscan -a {target} --ulimit 5000 -- -sV")
-        self.register("naabu", "naabu -host {target} -silent -json")
+        self.register("nmap", ["nmap", "-T4", "-F", "--open", "-oX", "-", "{target}"])
+        self.register("rustscan", ["rustscan", "-a", "{target}", "--ulimit", "5000", "--", "-sV"])
+        self.register("naabu", ["naabu", "-host", "{target}", "-silent", "-json"])
 
-        # Web tech
-        self.register("whatweb", "whatweb --color=never --aggression=3 {target}")
-        self.register("httpx", "echo {target} | httpx -silent -json -status-code -title -tech-detect")
-        self.register("httprobe", "echo {target} | httprobe -c 50")
+        self.register("whatweb", ["whatweb", "--color=never", "--aggression=3", "{target}"])
+        self.register("httpx", ["httpx", "-silent", "-json", "-status-code", "-title", "-tech-detect"], stdin_target=True)
+        self.register("httprobe", ["httprobe", "-c", "50"], stdin_target=True)
 
-        # Vuln scan
-        self.register("nuclei", "echo {target} | nuclei -silent -jsonl -severity critical,high")
-        self.register("nikto", "nikto -h {target} -Format json -output /dev/stdout")
+        self.register("nuclei", ["nuclei", "-silent", "-jsonl", "-severity", "critical,high"], stdin_target=True)
+        self.register("nikto", ["nikto", "-h", "{target}", "-Format", "json", "-output", "/dev/stdout"])
 
-        # Content discovery
-        self.register("gobuster", "gobuster dir -u https://{target} -w {wordlist} -q -k --no-error")
-        self.register("feroxbuster", "feroxbuster -u https://{target} -w {wordlist} -q --no-state")
-        self.register("dirsearch", "dirsearch -u https://{target} -w {wordlist} -q -e php,asp,aspx,txt,html")
+        self.register("gobuster", ["gobuster", "dir", "-u", "https://{target}", "-w", "{wordlist}", "-q", "-k", "--no-error"])
+        self.register("feroxbuster", ["feroxbuster", "-u", "https://{target}", "-w", "{wordlist}", "-q", "--no-state"])
+        self.register("dirsearch", ["dirsearch", "-u", "https://{target}", "-w", "{wordlist}", "-q", "-e", "php,asp,aspx,txt,html"])
 
-    def register(self, name: str, cmd_template: str):
-        self.tools[name] = Tool(name, cmd_template)
+    def register(self, name: str, cmd_template: List[str], stdin_target: bool = False):
+        self.tools[name] = Tool(name, cmd_template, stdin_target=stdin_target)
 
     def get_allowed_tools(self, depth: str) -> List[str]:
         return [t for t in self.tools if self.policy.is_tool_allowed(t, depth)]
@@ -419,44 +543,60 @@ class ToolRegistry:
         return self.get_missing_tools(depth)
 
 
-# ========================== SQLITE DB ==========================
 class SQLiteDB:
     def __init__(self, db_path: Path):
         self.conn = sqlite3.connect(db_path)
-        self.conn.execute("""
+        self.conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS findings (
                 id TEXT PRIMARY KEY,
                 tool TEXT, asset TEXT, indicator TEXT, value TEXT,
                 type TEXT, severity TEXT, confidence REAL,
                 timestamp TEXT, correlated_to TEXT
             )
-        """)
+            """
+        )
         self.conn.commit()
 
     def add_finding(self, finding_dict: Dict):
-        self.conn.execute("""
+        self.conn.execute(
+            """
             INSERT INTO findings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            finding_dict["id"], finding_dict["tool"], finding_dict["asset"],
-            finding_dict["indicator"], finding_dict["value"], finding_dict["type"],
-            finding_dict["severity"], finding_dict["confidence"],
-            finding_dict["timestamp"], json.dumps(finding_dict.get("correlated_to", []))
-        ))
+            """,
+            (
+                finding_dict["id"],
+                finding_dict["tool"],
+                finding_dict["asset"],
+                finding_dict["indicator"],
+                finding_dict["value"],
+                finding_dict["type"],
+                finding_dict["severity"],
+                finding_dict["confidence"],
+                finding_dict["timestamp"],
+                json.dumps(finding_dict.get("correlated_to", [])),
+            ),
+        )
         self.conn.commit()
 
     def close(self):
         self.conn.close()
 
 
-# ========================== RECON AGENT ==========================
 class ReconAgentRun:
-    def __init__(self, registry: ToolRegistry, db: SQLiteDB, semaphore: asyncio.Semaphore,
-                 output_dir: Path, retries: int, state_machine: RunStateMachine):
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        db: SQLiteDB,
+        semaphore: asyncio.Semaphore,
+        output_dir: Path,
+        retries: int,
+        state_machine: RunStateMachine,
+    ):
         self.registry = registry
         self.db = db
         self.semaphore = semaphore
         self.output_dir = output_dir
-        self.retries = retries
+        self.retries = max(0, retries)
         self.state = state_machine
         self.correlator = CorrelationEngine()
 
@@ -470,13 +610,12 @@ class ReconAgentRun:
             span.set_attribute("targets_count", len(targets))
 
             for target in targets:
-                target_dir = self.output_dir / target.replace("/", "_")
+                target_dir = self.output_dir / sanitize_filename_fragment(target)
                 target_dir.mkdir(parents=True, exist_ok=True)
 
                 try:
                     tools = self.registry.get_allowed_tools(depth)
-                    tasks = [self.registry.tools[t].execute(target, self.semaphore, target_dir, self.retries)
-                             for t in tools]
+                    tasks = [self.registry.tools[t].execute(target, self.semaphore, target_dir, self.retries) for t in tools]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
 
                     for res in results:
@@ -485,12 +624,13 @@ class ReconAgentRun:
                         elif isinstance(res, list):
                             for f in res:
                                 self.correlator.add_finding(f)
-                                self.db.add_finding(f.model_dump())
                 except Exception as e:
                     errors.append(str(e))
 
-        correlated = self.correlator.correlate()
         unique = self.correlator.deduplicate()
+        correlated = CorrelationEngine.correlate(unique)
+        for finding in correlated:
+            self.db.add_finding(finding.model_dump())
 
         final_state = RunState.COMPLETED if not errors else RunState.PARTIAL_SUCCESS
         self.state.transition(final_state)
@@ -500,33 +640,30 @@ class ReconAgentRun:
             "targets": targets,
             "depth": depth,
             "state": final_state.value,
-            "findings_count": len(unique),
+            "findings_count": len(correlated),
             "duration_seconds": round(time.time() - start, 1),
             "errors": errors,
             "output_dir": str(self.output_dir),
         }
 
 
-# ========================== EXPORT ==========================
 def export_results(db: SQLiteDB, output_dir: Path):
-    findings = db.conn.execute("SELECT * FROM findings").fetchall()
-    cols = [desc[0] for desc in db.conn.execute("SELECT * FROM findings").description]
+    cursor = db.conn.execute("SELECT * FROM findings")
+    findings = cursor.fetchall()
+    cols = [desc[0] for desc in cursor.description]
 
-    # JSONL
     with open(output_dir / "findings.jsonl", "w", encoding="utf-8") as f:
         for row in findings:
             f.write(json.dumps(dict(zip(cols, row))) + "\n")
 
-    # CSV
     with open(output_dir / "findings.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(cols)
         writer.writerows(findings)
 
 
-# ========================== CLI ==========================
 def parse_args():
-    parser = argparse.ArgumentParser(description="Enterprise Recon Agent v3.2")
+    parser = argparse.ArgumentParser(description="Enterprise Recon Agent v3.3")
     parser.add_argument("target", nargs="?", help="Single target")
     parser.add_argument("--file", "-f", help="Targets file")
     parser.add_argument("--depth", choices=["passive", "standard", "deep"], default="standard")
@@ -534,37 +671,40 @@ def parse_args():
     parser.add_argument("--threads", "-t", type=int, default=8)
     parser.add_argument("--retries", type=int, default=2)
     parser.add_argument("--scope-file", required=True, help="Signed scope.json")
-    parser.add_argument("--scope-secret", help="Secret (or use RECON_SCOPE_SECRET env var)")
-    parser.add_argument("--update-scope", action="store_true", help="Auto-merge targets.txt into scope.json and re-sign")
+    parser.add_argument("--scope-secret", help="Secret (prefer RECON_SCOPE_SECRET env var)")
+    parser.add_argument("--update-scope", action="store_true", help="Auto-merge targets file into scope.json and re-sign")
     parser.add_argument("--policy", help="Policy JSON file")
-    parser.add_argument("--auto-install", action="store_true",
-                        help="Attempt apt-based install of missing tools on Kali Linux")
+    parser.add_argument("--auto-install", action="store_true", help="Attempt apt-based install of missing tools on Kali Linux")
     parser.add_argument("--verbose", "-v", action="store_true")
     return parser.parse_args()
 
 
-# ========================== MAIN ==========================
 async def main():
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("recon_started", version="3.2", depth=args.depth)
+    _configure_logger(output_dir / "recon.log")
+    global logger
+    logger = structlog.get_logger("recon_agent")
+
+    logger.info("recon_started", version="3.3", depth=args.depth)
+
+    if args.scope_secret:
+        logger.warning("scope_secret_cli_used", message="Prefer RECON_SCOPE_SECRET env var over --scope-secret")
 
     secret = args.scope_secret or os.getenv("RECON_SCOPE_SECRET")
     if not secret:
         logger.error("missing_scope_secret")
-        print("❌ Error: Scope secret is required (--scope-secret or RECON_SCOPE_SECRET env var)")
+        print("❌ Error: Scope secret is required (set RECON_SCOPE_SECRET; --scope-secret is supported but discouraged)")
         sys.exit(1)
 
-    # ====================== ENHANCED --update-scope BLOCK ======================
     if args.update_scope and args.file:
         logger.info("scope_update_attempted", scope_file=args.scope_file, targets_file=args.file)
-
         try:
             raw_lines = Path(args.file).read_text(encoding="utf-8").splitlines()
-            valid_targets = []
-            invalid_targets = []
+            valid_targets: List[str] = []
+            invalid_targets: List[str] = []
 
             for line in raw_lines:
                 if line.strip():
@@ -574,46 +714,35 @@ async def main():
                         invalid_targets.append(line.strip())
 
             if invalid_targets:
-                logger.warning("invalid_targets_skipped",
-                               count=len(invalid_targets),
-                               examples=invalid_targets[:5])
+                logger.warning("invalid_targets_skipped", count=len(invalid_targets), examples=invalid_targets[:5])
 
             if not valid_targets:
                 logger.error("no_valid_targets_in_file", targets_file=args.file)
-                print("❌ Error: No valid targets found in targets.txt")
+                print("❌ Error: No valid targets found in targets file")
                 sys.exit(1)
 
             ScopeValidator.update_and_resign(args.scope_file, valid_targets, secret)
-
         except FileNotFoundError:
             logger.error("targets_file_not_found", file=args.file)
             print(f"❌ Error: Targets file '{args.file}' not found.")
             sys.exit(1)
-
         except PermissionError:
             logger.error("permission_denied_updating_scope", scope_file=args.scope_file)
             print(f"❌ Error: Cannot write to '{args.scope_file}' (permission denied).")
             sys.exit(1)
-
         except ValueError as e:
             logger.error("scope_update_value_error", error=str(e))
             print(f"❌ Scope update failed: {e}")
             sys.exit(1)
-
-        except Exception as e:
-            logger.exception("unexpected_scope_update_error",
-                             scope_file=args.scope_file,
-                             targets_file=args.file)
-            print(f"❌ Unexpected error while updating scope: {e}")
+        except Exception:
+            logger.exception("unexpected_scope_update_error", scope_file=args.scope_file, targets_file=args.file)
+            print("❌ Unexpected error while updating scope.")
             if args.verbose:
                 import traceback
+
                 traceback.print_exc()
             sys.exit(1)
 
-        else:
-            logger.info("scope_update_completed_successfully")
-
-    # ====================== Normal flow continues ======================
     ScopeValidator.runtime_acknowledgement()
     allowed_targets = ScopeValidator.verify_signed_scope(args.scope_file, secret)
     canonical_allowed = set()
@@ -623,20 +752,23 @@ async def main():
         except ValueError:
             logger.warning("invalid_allowed_target_in_scope", target=allowed)
 
-    # Load and filter targets
-    targets = []
+    targets: List[str] = []
     if args.target:
         targets.append(parse_and_canonicalize_target(args.target))
     if args.file:
-        targets.extend([parse_and_canonicalize_target(line) for line in
-                        Path(args.file).read_text(encoding="utf-8").splitlines() if line.strip()])
+        targets.extend(
+            [
+                parse_and_canonicalize_target(line)
+                for line in Path(args.file).read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        )
 
     targets = [t for t in targets if t in canonical_allowed]
     if not targets:
         logger.error("no_valid_targets_in_scope")
         sys.exit(1)
 
-    # Policy & Registry
     policy = PolicyEngine(args.policy)
     registry = ToolRegistry(policy)
     if args.auto_install:
