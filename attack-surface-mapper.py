@@ -293,7 +293,8 @@ class Tool:
         self.extra_flags: List[str] = []
 
     def is_installed(self) -> bool:
-        return shutil.which(self.name) is not None
+        executable = self.cmd_template[0] if self.cmd_template else self.name
+        return shutil.which(executable) is not None
 
     def _build_command(self, target: str) -> List[str]:
         command = [part.format(target=target, wordlist=DEFAULT_WORDLIST) for part in self.cmd_template]

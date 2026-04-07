@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "attack-surface-mapper.py"
 spec = importlib.util.spec_from_file_location("attack_surface_mapper", MODULE_PATH)
@@ -76,7 +77,12 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertIn("open_tcp_443", findings[0].indicator)
 
-
+    def test_is_installed_checks_command_name_not_registry_key(self):
+     tool = asm.Tool("theharvester", ["theHarvester", "-d", "{target}"])
+     with patch.object(asm.shutil, "which", return_value="/usr/bin/theHarvester") as which_mock:
+        self.assertTrue(tool.is_installed())
+        which_mock.assert_called_once_with("theHarvester")
+        
 class AsyncRunTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_recon_marks_partial_on_tool_exception(self):
         class BrokenTool:
