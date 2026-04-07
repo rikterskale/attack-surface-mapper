@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import hmac
 import importlib.util
 import json
 import tempfile
@@ -19,6 +21,16 @@ class ScopeValidatorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 asm.ScopeValidator.verify_signed_scope(str(scope), "secret")
 
+    def test_verify_signed_scope_accepts_valid_signature(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            scope = Path(tmpdir) / "scope.json"
+            targets = ["example.com"]
+            payload = json.dumps({"allowed_targets": targets}, sort_keys=True).encode()
+            signature = hmac.new(b"secret123", payload, hashlib.sha256).hexdigest()
+            scope.write_text(json.dumps({"allowed_targets": targets, "signature": signature}), encoding="utf-8")
+            verified = asm.ScopeValidator.verify_signed_scope(str(scope), "secret123")
+            self.assertEqual(verified, targets)
+
 
 class TargetParsingTests(unittest.TestCase):
     def test_parse_target_with_scheme_and_port(self):
@@ -28,6 +40,41 @@ class TargetParsingTests(unittest.TestCase):
     def test_sanitize_filename_fragment(self):
         cleaned = asm.sanitize_filename_fragment("2001:db8::1")
         self.assertNotIn(":", cleaned)
+
+
+class CorrelationTests(unittest.TestCase):
+    def test_dedup_then_correlate(self):
+        c = asm.CorrelationEngine()
+        vuln1 = asm.Finding(tool="nuclei", asset="example.com", indicator="tmpl-1", value="v1", type="vulnerability")
+        vuln2 = asm.Finding(tool="nuclei", asset="example.com", indicator="tmpl-2", value="v2", type="vulnerability")
+        dup = asm.Finding(tool="nuclei", asset="example.com", indicator="tmpl-2", value="v2-dup", type="vulnerability")
+        c.add_finding(vuln1)
+        c.add_finding(vuln2)
+        c.add_finding(dup)
+
+        unique = c.deduplicate()
+        correlated = asm.CorrelationEngine.correlate(unique)
+
+        self.assertEqual(len(unique), 2)
+        for finding in correlated:
+            self.assertEqual(len(finding.correlated_to), 1)
+
+
+class ParserTests(unittest.TestCase):
+    def test_nuclei_json_parser(self):
+        tool = asm.Tool("nuclei", ["nuclei"])
+        output = '{"template-id":"xss-test","matched-at":"https://a.example","info":{"severity":"high"}}\n'
+        findings = tool._parse_output(output, "example.com")
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].type, "vulnerability")
+        self.assertEqual(findings[0].severity, "high")
+
+    def test_nmap_xml_parser(self):
+        tool = asm.Tool("nmap", ["nmap"])
+        output = """<nmaprun><host><address addr='10.0.0.1'/><ports><port protocol='tcp' portid='443'><state state='open'/><service name='https'/></port></ports></host></nmaprun>"""
+        findings = tool._parse_output(output, "10.0.0.1")
+        self.assertEqual(len(findings), 1)
+        self.assertIn("open_tcp_443", findings[0].indicator)
 
 
 class AsyncRunTests(unittest.IsolatedAsyncioTestCase):
