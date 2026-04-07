@@ -114,13 +114,16 @@ class RunStateMachine:
 
 
 class PolicyEngine:
+    _BUILTIN_TOOLS: Dict[str, List[str]] = {
+        "passive": ["amass", "subfinder", "assetfinder", "knockpy", "theharvester", "sherlock"],
+        "standard": ["nmap", "rustscan", "naabu", "whatweb", "httpx", "httprobe"],
+        "deep": ["nuclei", "nikto", "gobuster", "feroxbuster", "dirsearch"],
+    }
+
     def __init__(self, policy_path: str | None = None):
+        tools_map = self._load_external_tools_json()
         self.policy: Dict = {
-            "allowed_tools": {
-                "passive": ["amass", "subfinder", "assetfinder", "knockpy", "theharvester", "sherlock"],
-                "standard": ["nmap", "rustscan", "naabu", "whatweb", "httpx", "httprobe"],
-                "deep": ["nuclei", "nikto", "gobuster", "feroxbuster", "dirsearch"],
-            },
+            "allowed_tools": tools_map,
             "environment": "production",
             "asset_classes": {"public": True, "internal": False},
         }
@@ -131,6 +134,21 @@ class PolicyEngine:
                 logger.info("policy_loaded", path=policy_path)
             except Exception as e:
                 logger.error("policy_load_failed", error=str(e))
+
+    @classmethod
+    def _load_external_tools_json(cls) -> Dict[str, List[str]]:
+        """Load tool-to-depth mapping from external_tools.json next to this script."""
+        tools_file = Path(__file__).resolve().parent / "external_tools.json"
+        if tools_file.exists():
+            try:
+                data = json.loads(tools_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and all(isinstance(v, list) for v in data.values()):
+                    logger.info("external_tools_loaded", path=str(tools_file))
+                    return data
+                logger.warning("external_tools_invalid_schema", path=str(tools_file))
+            except Exception as e:
+                logger.warning("external_tools_load_failed", error=str(e))
+        return dict(cls._BUILTIN_TOOLS)
 
     def is_tool_allowed(self, tool: str, depth: str) -> bool:
         return tool in self.policy["allowed_tools"].get(depth, [])
