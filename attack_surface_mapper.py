@@ -1122,6 +1122,7 @@ async def main():
         _cleanup_span_handle()
         _cleanup_span_handle()
         _cleanup_span_handle()
+        _cleanup_span_handle()
 
     logger.info("recon_completed", **result)
     print("\n" + "=" * 80)
