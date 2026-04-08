@@ -14,10 +14,20 @@ Attack Surface Mapper (v3.4.0) is a Python-based recon orchestrator that enforce
 
 ## Install
 
+Runtime-only install (scanner usage):
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+Contributor/dev install (needed for lint/typecheck/tests and console-script packaging path):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 ```
 
 ## Quick Start
@@ -149,7 +159,7 @@ make ci         # Run all three in order (same as CI pipeline)
 make clean      # Remove caches, venvs, output dirs
 ```
 
-CI runs automatically on push/PR via GitHub Actions across Python 3.10–3.13.
+CI runs automatically on push/PR via GitHub Actions across Python 3.10–3.13; lint/test run on all matrix versions, while mypy runs once on Python 3.12.
 
 ### Automated / CI Scanning
 

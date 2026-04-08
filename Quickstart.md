@@ -9,10 +9,20 @@
 
 ## 2) Install
 
+Runtime-only install:
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+If you plan to run lint/typecheck/tests locally, use dev install instead:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 ```
 
 ## 3) Create signed scope
