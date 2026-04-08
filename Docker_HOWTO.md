@@ -6,9 +6,12 @@ This guide explains how to build and run **Attack Surface Mapper** with Docker f
 
 ## 1) What Docker does here
 
-Docker packages the app and its Python dependencies into an image so you can run it consistently across machines.
+Docker packages:
+- The app + Python dependencies
+- Python dev tools (`pip`, `ruff`, `mypy`, `pytest`)
+- Common external recon tools used by this project, including `amass`, `subfinder`, `assetfinder`, `nmap`, `naabu`, `httpx`, `nuclei`, `nikto`, `gobuster`, `whatweb`, `httprobe`, and Python-based tools (`knockpy`, `theHarvester`, `sherlock`, `dirsearch`)
 
-> Important: This image includes the Python app and library dependencies. Most external recon binaries (`nmap`, `amass`, `subfinder`, etc.) are still host/container tool dependencies and may not be installed in the image by default.
+So to your question: **yes, the image is now configured to include tools like `amass`, `nuclei`, and `nmap` by default**.
 
 ---
 
@@ -35,13 +38,32 @@ docker build -t attack-surface-mapper:latest .
 
 What this does:
 - Uses `Dockerfile`
-- Installs Python deps
-- Copies project files
-- Sets default command to show CLI help
+- Installs system packages needed for external recon binaries
+- Installs Go-based recon binaries (`amass`, `subfinder`, `naabu`, `httpx`, `nuclei`, etc.)
+- Installs Python-based recon tools (`knockpy`, `theHarvester`, `sherlock`, `dirsearch`)
+- Installs project dependencies and Python dev tooling via `pip install -e ".[dev]"`
 
 ---
 
-## 4) Quick sanity check
+## 4) Verify included toolchain
+
+Run these checks after build:
+
+```bash
+docker run --rm attack-surface-mapper:latest python --version
+docker run --rm attack-surface-mapper:latest pip --version
+docker run --rm attack-surface-mapper:latest ruff --version
+docker run --rm attack-surface-mapper:latest mypy --version
+docker run --rm attack-surface-mapper:latest pytest --version
+
+docker run --rm attack-surface-mapper:latest amass -version
+docker run --rm attack-surface-mapper:latest nuclei -version
+docker run --rm attack-surface-mapper:latest nmap --version
+```
+
+---
+
+## 5) Quick sanity check
 
 Show help text from inside container:
 
@@ -57,7 +79,7 @@ docker run --rm attack-surface-mapper:latest python attack_surface_mapper.py --h
 
 ---
 
-## 5) Create signed scope from container
+## 6) Create signed scope from container
 
 Interactive scope creation (writes file to your host directory):
 
@@ -73,7 +95,7 @@ This creates `scope.json` in your current host folder.
 
 ---
 
-## 6) Run scanner from container
+## 7) Run scanner from container
 
 Example run:
 
@@ -95,7 +117,7 @@ Notes:
 
 ---
 
-## 7) Running non-interactive in CI-like mode
+## 8) Running non-interactive in CI-like mode
 
 If you need to bypass the acknowledgement prompt intentionally:
 
@@ -113,14 +135,6 @@ docker run --rm \
 ```
 
 Both `RECON_UNATTENDED=1` and `--no-ack` are required.
-
----
-
-## 8) External tool availability
-
-The scanner can call third-party tools. If they are not installed in the image, the app logs warnings and skips them.
-
-For a fully tooled image, you can extend the Dockerfile later to install specific binaries needed by your workflow.
 
 ---
 
