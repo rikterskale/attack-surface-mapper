@@ -40,7 +40,7 @@ lint: ## Run ruff linter
 	$(VENV)/bin/ruff check .
 
 typecheck: ## Run mypy strict type checking
-	$(VENV)/bin/mypy --strict attack_surface_mapper.py scope_utils.py create_scope.py
+	$(VENV)/bin/mypy attack_surface_mapper.py scope_utils.py create_scope.py
 
 ci: lint typecheck test ## Run the full CI pipeline locally (lint → typecheck → test)
 

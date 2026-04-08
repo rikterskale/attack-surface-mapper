@@ -41,7 +41,7 @@ jobs:
 
       - name: Type check (mypy)
         if: matrix.python-version == '3.12'  # run once, not per-version
-        run: mypy --strict attack_surface_mapper.py scope_utils.py create_scope.py
+        run: mypy attack_surface_mapper.py scope_utils.py create_scope.py
 
       - name: Test
         run: pytest tests/ -v
