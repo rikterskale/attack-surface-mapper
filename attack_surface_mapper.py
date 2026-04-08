@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import structlog
 from defusedxml.ElementTree import fromstring as safe_xml_fromstring
@@ -35,14 +35,11 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExport
 from pydantic import BaseModel, Field
 
 from scope_utils import (
-    MIN_SECRET_LENGTH,
-    canonicalize_targets,
     compute_signature,
     is_target_in_scope,
     parse_and_canonicalize_target,
     parse_targets_from_lines,
     update_and_resign,
-    validate_scope_schema,
     validate_secret,
     verify_signed_scope,
 )

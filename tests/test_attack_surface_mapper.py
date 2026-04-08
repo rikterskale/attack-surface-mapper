@@ -1,13 +1,11 @@
 import asyncio
-import hashlib
-import hmac
 import importlib.util
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # ---------------------------------------------------------------------------
 # Import the main module.  The file was renamed from hyphenated to

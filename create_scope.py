@@ -8,6 +8,7 @@ signing so the HMAC matches regardless of how the operator formats them.
 
 import argparse
 import getpass
+import json
 import sys
 from pathlib import Path
 
@@ -17,8 +18,6 @@ from scope_utils import (
     parse_and_canonicalize_target,
     validate_secret,
 )
-import json
-
 
 # ---------------------------------------------------------------------------
 # Main

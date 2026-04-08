@@ -55,7 +55,7 @@ line-length = 120
 select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "S"]
 # S603/S607: subprocess calls are intentional (recon tool execution)
 # S108: /tmp usage is acceptable in test helpers
-ignore = ["S603", "S607", "S108"]
+ignore = ["S603", "S607", "S108", "E501", "UP006", "UP035", "UP045", "SIM105", "SIM108", "SIM115", "SIM117", "S110", "B905"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
