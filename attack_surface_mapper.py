@@ -716,7 +716,7 @@ class ToolRegistry:
 
         packages = sorted({self.package_map.get(tool, tool) for tool in missing})
         cmd = [apt, "install", "-y", *packages]
-        if os.getuid() != 0:
+        if hasattr(os, "getuid") and os.getuid() != 0:
             sudo = shutil.which("sudo")
             if not sudo:
                 logger.warning("auto_install_needs_root", missing=missing)
@@ -919,24 +919,6 @@ async def main():
     global logger
     logger = structlog.get_logger("recon_agent")
 
-    # Write span traces to a file instead of stdout.
-    global _SPAN_FILE_HANDLE, _SPAN_EXPORTER_CONFIGURED
-    try:
-        span_log_path = output_dir / "spans.jsonl"
-        _SPAN_FILE_HANDLE = open(span_log_path, "a", encoding="utf-8")
-
-        class _FileSpanExporter(ConsoleSpanExporter):
-            def __init__(self, fh):
-                super().__init__(out=fh)
-
-        if not _SPAN_EXPORTER_CONFIGURED:
-            _tracer_provider.add_span_processor(
-                BatchSpanProcessor(_FileSpanExporter(_SPAN_FILE_HANDLE))
-            )
-            _SPAN_EXPORTER_CONFIGURED = True
-    except Exception as e:
-        logger.warning("span_exporter_setup_failed", error=str(e))
-
     logger.info("recon_started", version=__version__, depth=args.depth)
 
     if args.scope_secret:
@@ -1110,6 +1092,24 @@ async def main():
     if missing_tools:
         logger.warning("missing_tools", depth=args.depth, tools=missing_tools)
 
+    # Write span traces to a file instead of stdout (only for non-dry-run paths).
+    global _SPAN_FILE_HANDLE, _SPAN_EXPORTER_CONFIGURED
+    try:
+        span_log_path = output_dir / "spans.jsonl"
+        _SPAN_FILE_HANDLE = open(span_log_path, "a", encoding="utf-8")
+
+        class _FileSpanExporter(ConsoleSpanExporter):
+            def __init__(self, fh):
+                super().__init__(out=fh)
+
+        if not _SPAN_EXPORTER_CONFIGURED:
+            _tracer_provider.add_span_processor(
+                BatchSpanProcessor(_FileSpanExporter(_SPAN_FILE_HANDLE))
+            )
+            _SPAN_EXPORTER_CONFIGURED = True
+    except Exception as e:
+        logger.warning("span_exporter_setup_failed", error=str(e))
+
     db = SQLiteDB(output_dir / "findings.db")
     try:
         semaphore = asyncio.Semaphore(args.threads)
@@ -1121,6 +1121,8 @@ async def main():
         export_results(db, output_dir)
     finally:
         db.close()
+        _cleanup_span_handle()
+        _cleanup_span_handle()
 
     logger.info("recon_completed", **result)
     print("\n" + "=" * 80)
