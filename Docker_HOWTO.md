@@ -13,6 +13,8 @@ Docker packages:
 
 So to your question: **yes, the image is now configured to include tools like `amass`, `nuclei`, and `nmap` by default**.
 
+> Note: `nikto` is installed from its upstream GitHub repository in this image because it is not available as an apt package in the base Debian slim image.
+
 ---
 
 ## 2) Prerequisites
@@ -38,7 +40,7 @@ docker build -t attack-surface-mapper:latest .
 
 What this does:
 - Uses `Dockerfile`
-- Installs system packages needed for external recon binaries
+- Installs system packages needed for external recon binaries and installs Nikto from upstream GitHub
 - Installs Go-based recon binaries (`amass`, `subfinder`, `naabu`, `httpx`, `nuclei`, etc.)
 - Installs Python-based recon tools (`knockpy`, `theHarvester`, `sherlock`, `dirsearch`)
 - Installs project dependencies and Python dev tooling via `pip install -e ".[dev]"`

@@ -1,266 +1,83 @@
 #!/usr/bin/env python3
-"""Patch Docker assets so the image ships Python + recon tooling by default.
-
-This script is idempotent: running it repeatedly keeps the same desired content.
-"""
-
 from pathlib import Path
 
 DOCKERFILE = Path("Dockerfile")
 HOWTO = Path("Docker_HOWTO.md")
 
-DOCKERFILE_CONTENT = """FROM python:3.13-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \\
-    PYTHONUNBUFFERED=1 \\
-    GO111MODULE=on \\
-    GOBIN=/usr/local/bin
-
-WORKDIR /app
-
-# Install system and language toolchains used by recon tools.
-RUN apt-get update && \\
-    apt-get install -y --no-install-recommends \\
-      ca-certificates \\
-      curl \\
-      git \\
-      golang-go \\
-      gobuster \\
-      nikto \\
-      nmap \\
-      unzip \\
-      whatweb && \\
-    rm -rf /var/lib/apt/lists/*
-
-# Install Go-based recon tools.
-RUN go install github.com/owasp-amass/amass/v4/...@latest && \\
-    go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \\
-    go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest && \\
-    go install github.com/projectdiscovery/httpx/cmd/httpx@latest && \\
-    go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest && \\
-    go install github.com/tomnomnom/assetfinder@latest && \\
-    go install github.com/tomnomnom/httprobe@latest
-
-# Install Python-based recon tools plus this project and dev tooling.
-COPY . .
-RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \\
-    python -m pip install --no-cache-dir \\
-      dirsearch \\
-      knockpy \\
-      sherlock-project \\
-      theHarvester && \\
-    python -m pip install --no-cache-dir -e ".[dev]" && \\
-    python --version && \\
-    pip --version && \\
-    ruff --version && \\
-    mypy --version && \\
-    pytest --version && \\
-    amass -version && \\
-    nuclei -version && \\
-    nmap --version
-
-# Default command shows CLI help.
-CMD ["python", "attack_surface_mapper.py", "--help"]
-"""
-
-HOWTO_CONTENT = """# Docker How-To Guide (Beginner Friendly)
-
-This guide explains how to build and run **Attack Surface Mapper** with Docker from scratch.
-
----
-
-## 1) What Docker does here
-
-Docker packages:
-- The app + Python dependencies
-- Python dev tools (`pip`, `ruff`, `mypy`, `pytest`)
-- Common external recon tools used by this project, including `amass`, `subfinder`, `assetfinder`, `nmap`, `naabu`, `httpx`, `nuclei`, `nikto`, `gobuster`, `whatweb`, `httprobe`, and Python-based tools (`knockpy`, `theHarvester`, `sherlock`, `dirsearch`)
-
-So to your question: **yes, the image is now configured to include tools like `amass`, `nuclei`, and `nmap` by default**.
-
----
-
-## 2) Prerequisites
-
-Install Docker Desktop (Windows/macOS) or Docker Engine (Linux), then verify:
-
-```bash
-docker --version
-docker info
-```
-
-If `docker info` fails, make sure Docker is running.
-
----
-
-## 3) Build the image
-
-From the repository root:
-
-```bash
-docker build -t attack-surface-mapper:latest .
-```
-
-What this does:
-- Uses `Dockerfile`
-- Installs system packages needed for external recon binaries
-- Installs Go-based recon binaries (`amass`, `subfinder`, `naabu`, `httpx`, `nuclei`, etc.)
-- Installs Python-based recon tools (`knockpy`, `theHarvester`, `sherlock`, `dirsearch`)
-- Installs project dependencies and Python dev tooling via `pip install -e ".[dev]"`
-
----
-
-## 4) Verify included toolchain
-
-Run these checks after build:
-
-```bash
-docker run --rm attack-surface-mapper:latest python --version
-docker run --rm attack-surface-mapper:latest pip --version
-docker run --rm attack-surface-mapper:latest ruff --version
-docker run --rm attack-surface-mapper:latest mypy --version
-docker run --rm attack-surface-mapper:latest pytest --version
-
-docker run --rm attack-surface-mapper:latest amass -version
-docker run --rm attack-surface-mapper:latest nuclei -version
-docker run --rm attack-surface-mapper:latest nmap --version
-```
-
----
-
-## 5) Quick sanity check
-
-Show help text from inside container:
-
-```bash
-docker run --rm attack-surface-mapper:latest
-```
-
-or explicitly:
-
-```bash
-docker run --rm attack-surface-mapper:latest python attack_surface_mapper.py --help
-```
-
----
-
-## 6) Create signed scope from container
-
-Interactive scope creation (writes file to your host directory):
-
-```bash
-docker run --rm -it \\
-  -v "$(pwd):/work" \\
-  -w /work \\
-  attack-surface-mapper:latest \\
-  python create_scope.py
-```
-
-This creates `scope.json` in your current host folder.
-
----
-
-## 7) Run scanner from container
-
-Example run:
-
-```bash
-docker run --rm -it \\
-  -v "$(pwd):/work" \\
-  -w /work \\
-  -e RECON_SCOPE_SECRET="your-secret-min-16-chars" \\
-  attack-surface-mapper:latest \\
-  python attack_surface_mapper.py example.com \\
-    --scope-file scope.json \\
-    --depth passive \\
-    --output-dir results/example.com
-```
-
-Notes:
-- `-v "$(pwd):/work"` mounts your current folder so outputs persist on host.
-- `-e RECON_SCOPE_SECRET=...` passes secret without CLI argument exposure.
-
----
-
-## 8) Running non-interactive in CI-like mode
-
-If you need to bypass the acknowledgement prompt intentionally:
-
-```bash
-docker run --rm \\
-  -v "$(pwd):/work" \\
-  -w /work \\
-  -e RECON_SCOPE_SECRET="your-secret-min-16-chars" \\
-  -e RECON_UNATTENDED=1 \\
-  attack-surface-mapper:latest \\
-  python attack_surface_mapper.py example.com \\
-    --scope-file scope.json \\
-    --depth passive \\
-    --no-ack
-```
-
-Both `RECON_UNATTENDED=1` and `--no-ack` are required.
-
----
-
-## 9) Common troubleshooting
-
-### A) `scope.json not found`
-- Ensure your host directory is mounted (`-v "$(pwd):/work"`).
-- Ensure `--scope-file` path is correct inside container.
-
-### B) Permission errors writing outputs
-- Verify mounted directory permissions.
-- Try writing to a mounted folder you own.
-
-### C) `missing_scope_secret`
-- Pass `RECON_SCOPE_SECRET` with `-e`.
-
-### D) Docker build fails due network
-- Retry on stable network.
-- Use internal package mirror/proxy if required by your environment.
-
----
-
-## 10) Useful cleanup commands
-
-Remove dangling images:
-
-```bash
-docker image prune -f
-```
-
-Remove all stopped containers:
-
-```bash
-docker container prune -f
-```
-
----
-
-## 11) CI integration note
-
-The GitHub Actions workflow includes a Docker build job that executes:
-
-```bash
-docker build -t attack-surface-mapper:ci .
-```
-
-This validates that the Docker image can be built on every push/PR.
-"""
-
-
-def _write_if_changed(path: Path, content: str) -> None:
-    if path.read_text(encoding="utf-8") != content:
-        path.write_text(content, encoding="utf-8")
-        print(f"[updated] {path}")
-    else:
-        print(f"[ok] {path} already up-to-date")
+def patch_dockerfile() -> bool:
+    if not DOCKERFILE.exists():
+        print("[skip] Dockerfile not found")
+        return False
+
+    s = DOCKERFILE.read_text(encoding="utf-8")
+    original = s
+
+    # 1) Remove `nikto` from apt install list (if present)
+    s = s.replace("\n      nikto \\\n", "\n")
+
+    # 2) Add upstream Nikto install block (if missing)
+    nikto_block = (
+        "# Install Nikto from upstream (not packaged in Debian slim images).\n"
+        "RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \\\n"
+        "    ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto\n\n"
+    )
+    anchor = "# Install Go-based recon tools.\n"
+    if "github.com/sullo/nikto.git" not in s and anchor in s:
+        s = s.replace(anchor, nikto_block + anchor, 1)
+
+    if s != original:
+        DOCKERFILE.write_text(s, encoding="utf-8")
+        print("[updated] Dockerfile")
+        return True
+
+    print("[ok] Dockerfile already patched")
+    return False
+
+
+def patch_howto() -> bool:
+    if not HOWTO.exists():
+        print("[skip] Docker_HOWTO.md not found")
+        return False
+
+    s = HOWTO.read_text(encoding="utf-8")
+    original = s
+
+    old_line = (
+        "- Installs system packages needed for external recon binaries\n"
+    )
+    new_line = (
+        "- Installs system packages needed for external recon binaries and installs Nikto from upstream GitHub\n"
+    )
+    s = s.replace(old_line, new_line)
+
+    # Add explanatory note if not already present
+    note_snippet = "nikto` is installed from its upstream GitHub repo"
+    if note_snippet not in s and "## 1) What Docker does here" in s:
+        s = s.replace(
+            "So to your question: **yes, the image is now configured to include tools like `amass`, `nuclei`, and `nmap` by default**.\n",
+            "So to your question: **yes, the image is now configured to include tools like `amass`, `nuclei`, and `nmap` by default**.\n\n"
+            "> Note: `nikto` is installed from its upstream GitHub repository in this image because it is not available as an apt package in the base Debian slim image.\n",
+            1,
+        )
+
+    if s != original:
+        HOWTO.write_text(s, encoding="utf-8")
+        print("[updated] Docker_HOWTO.md")
+        return True
+
+    print("[ok] Docker_HOWTO.md already patched")
+    return False
 
 
 def main() -> None:
-    _write_if_changed(DOCKERFILE, DOCKERFILE_CONTENT)
-    _write_if_changed(HOWTO, HOWTO_CONTENT)
+    changed = False
+    changed |= patch_dockerfile()
+    changed |= patch_howto()
+    if changed:
+        print("[done] Patch applied")
+    else:
+        print("[done] No changes needed")
 
 
 if __name__ == "__main__":

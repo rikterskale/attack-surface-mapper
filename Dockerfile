@@ -15,11 +15,14 @@ RUN apt-get update && \
       git \
       golang-go \
       gobuster \
-      nikto \
       nmap \
       unzip \
       whatweb && \
     rm -rf /var/lib/apt/lists/*
+
+# Install Nikto from upstream (not packaged in Debian slim images).
+RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \
+    ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto
 
 # Install Go-based recon tools.
 RUN go install github.com/owasp-amass/amass/v4/...@latest && \
