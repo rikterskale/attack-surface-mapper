@@ -15,6 +15,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -900,11 +901,51 @@ def parse_args():
         "--no-ack", action="store_true",
         help="Skip interactive acknowledgement prompt (requires RECON_UNATTENDED=1 env var as safety gate)",
     )
+    parser.add_argument(
+        "--tool-flags",
+        action="append",
+        dest="tool_flags",
+        metavar="TOOL=FLAGS",
+        default=None,
+        help=(
+            "Extra flags for a tool (repeatable). "
+            'Example: --tool-flags "nmap=-Pn -n -sS -T3"'
+        ),
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     args = parser.parse_args()
     if args.threads < 1:
         parser.error("--threads must be >= 1")
     return args
+
+
+def parse_tool_flags(items: Optional[List[str]]) -> Dict[str, List[str]]:
+    """Parse repeatable --tool-flags entries into {tool_name: [flags...]}.
+
+    Input format is ``TOOL=FLAGS`` (repeatable). Flags are shell-split using
+    :func:`shlex.split` so quoted values are preserved.
+    """
+    parsed: Dict[str, List[str]] = {}
+    if not items:
+        return parsed
+
+    for item in items:
+        if "=" not in item:
+            raise ValueError(f"Invalid --tool-flags entry '{item}' (expected TOOL=FLAGS)")
+
+        tool_name, flags_str = item.split("=", 1)
+        tool_name = tool_name.strip()
+        if not tool_name:
+            raise ValueError(f"Invalid --tool-flags entry '{item}' (tool name is empty)")
+
+        try:
+            flags = [f.strip() for f in shlex.split(flags_str) if f.strip()]
+        except ValueError as e:
+            raise ValueError(f"Invalid --tool-flags entry '{item}': {e}") from e
+
+        parsed.setdefault(tool_name, []).extend(flags)
+
+    return parsed
 
 
 async def main():
@@ -1039,6 +1080,23 @@ async def main():
     # ------------------------------------------------------------------
     policy = PolicyEngine(args.policy)
     registry = ToolRegistry(policy)
+
+    # Optional per-tool flag overrides from CLI (repeatable).
+    try:
+        user_tool_flags = parse_tool_flags(args.tool_flags)
+    except ValueError as e:
+        logger.error("invalid_tool_flags", error=str(e))
+        print(f"\u274c Error: {e}")
+        sys.exit(1)
+
+    for tool_name, flags in user_tool_flags.items():
+        tool = registry.tools.get(tool_name)
+        if not tool:
+            logger.error("unknown_tool_in_tool_flags", tool=tool_name)
+            print(f"\u274c Error: Unknown tool in --tool-flags: '{tool_name}'")
+            sys.exit(1)
+        tool.extra_flags.extend(flags)
+        logger.info("tool_flags_applied", tool=tool_name, flags=flags)
 
     # ------------------------------------------------------------------
     # Dry-run: show what would execute, then exit — BEFORE acknowledgement
