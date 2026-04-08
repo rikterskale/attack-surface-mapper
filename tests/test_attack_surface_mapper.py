@@ -274,7 +274,8 @@ class AutoInstallTests(unittest.TestCase):
 
         with patch.object(asm, "IS_KALI", True), \
              patch.object(asm.shutil, "which") as mock_which, \
-             patch.object(asm.subprocess, "run") as mock_run:
+             patch.object(asm.subprocess, "run") as mock_run, \
+             patch.object(asm.os, "getuid", return_value=0, create=True):
 
             def which_side_effect(cmd):
                 if cmd == "apt-get":
