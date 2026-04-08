@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import structlog
 from defusedxml.ElementTree import fromstring as safe_xml_fromstring
@@ -66,7 +66,7 @@ DEFAULT_WORDLIST = (
 # Non-transient exceptions that should NOT trigger a retry
 # ---------------------------------------------------------------------------
 
-_NON_TRANSIENT_ERRORS: Tuple[type, ...] = (
+_NON_TRANSIENT_ERRORS: Tuple[type[BaseException], ...] = (
     FileNotFoundError,
     PermissionError,
     NotADirectoryError,
@@ -92,7 +92,7 @@ def _configure_logger(log_path: Optional[Path] = None):
     global _LOG_FILE_HANDLE
     old_handle = _LOG_FILE_HANDLE
 
-    logger_factory = structlog.PrintLoggerFactory()
+    logger_factory: Any = structlog.PrintLoggerFactory()
     if log_path:
         _LOG_FILE_HANDLE = open(log_path, "a", encoding="utf-8")
         logger_factory = structlog.WriteLoggerFactory(file=_LOG_FILE_HANDLE)
