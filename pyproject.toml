@@ -56,4 +56,4 @@ ignore = ["S603", "S607", "S108"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-verbosity = 2
+addopts = "-vv"

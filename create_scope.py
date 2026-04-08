@@ -13,7 +13,6 @@ from pathlib import Path
 
 from scope_utils import (
     MIN_SECRET_LENGTH,
-    canonicalize_targets,
     compute_signature,
     parse_and_canonicalize_target,
     validate_secret,

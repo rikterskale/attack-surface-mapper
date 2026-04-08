@@ -147,11 +147,16 @@ tracer = trace.get_tracer(__name__)
 
 # Span file handle — registered with atexit for clean shutdown (fix #9).
 _SPAN_FILE_HANDLE = None
+_SPAN_EXPORTER_CONFIGURED = False
 
 
 def _cleanup_span_handle():
     """Close the span file handle on interpreter shutdown."""
     global _SPAN_FILE_HANDLE
+    try:
+        _tracer_provider.shutdown()
+    except Exception:
+        pass
     if _SPAN_FILE_HANDLE:
         try:
             _SPAN_FILE_HANDLE.close()
@@ -899,7 +904,10 @@ def parse_args():
         help="Skip interactive acknowledgement prompt (requires RECON_UNATTENDED=1 env var as safety gate)",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.threads < 1:
+        parser.error("--threads must be >= 1")
+    return args
 
 
 async def main():
@@ -912,7 +920,7 @@ async def main():
     logger = structlog.get_logger("recon_agent")
 
     # Write span traces to a file instead of stdout.
-    global _SPAN_FILE_HANDLE
+    global _SPAN_FILE_HANDLE, _SPAN_EXPORTER_CONFIGURED
     try:
         span_log_path = output_dir / "spans.jsonl"
         _SPAN_FILE_HANDLE = open(span_log_path, "a", encoding="utf-8")
@@ -921,9 +929,11 @@ async def main():
             def __init__(self, fh):
                 super().__init__(out=fh)
 
-        _tracer_provider.add_span_processor(
-            BatchSpanProcessor(_FileSpanExporter(_SPAN_FILE_HANDLE))
-        )
+        if not _SPAN_EXPORTER_CONFIGURED:
+            _tracer_provider.add_span_processor(
+                BatchSpanProcessor(_FileSpanExporter(_SPAN_FILE_HANDLE))
+            )
+            _SPAN_EXPORTER_CONFIGURED = True
     except Exception as e:
         logger.warning("span_exporter_setup_failed", error=str(e))
 
@@ -1000,7 +1010,23 @@ async def main():
     # ------------------------------------------------------------------
     # Gate 1: Verify signed scope FIRST
     # ------------------------------------------------------------------
-    allowed_targets = ScopeValidator.verify_signed_scope(args.scope_file, secret)
+    try:
+        allowed_targets = ScopeValidator.verify_signed_scope(args.scope_file, secret)
+    except FileNotFoundError:
+        logger.error("scope_file_not_found", scope_file=args.scope_file)
+        print(f"\u274c Error: Scope file '{args.scope_file}' not found.")
+        sys.exit(1)
+    except ValueError as e:
+        logger.error("scope_verification_failed", error=str(e))
+        print(f"\u274c Error: {e}")
+        sys.exit(1)
+    except Exception:
+        logger.exception("unexpected_scope_verification_error", scope_file=args.scope_file)
+        print("\u274c Unexpected error while verifying scope file.")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
 
     canonical_allowed = set()
     for allowed in allowed_targets:
@@ -1026,6 +1052,7 @@ async def main():
     targets = [t for t in targets if is_target_in_scope(t, canonical_allowed)]
     if not targets:
         logger.error("no_valid_targets_in_scope")
+        print("\u274c Error: No provided targets are authorized by the signed scope.")
         sys.exit(1)
 
     # ------------------------------------------------------------------

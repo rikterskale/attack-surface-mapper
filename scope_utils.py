@@ -191,6 +191,8 @@ def verify_signed_scope(scope_file: str, secret: str) -> List[str]:
     path = Path(scope_file)
     if not path.exists():
         raise FileNotFoundError(f"Scope file {scope_file} not found")
+    # Enforce the same secret policy used by CLI entry points.
+    validate_secret(secret)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     targets = validate_scope_schema(data)
