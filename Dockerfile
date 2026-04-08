@@ -25,7 +25,7 @@ RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \
     ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto
 
 # Install Go-based recon tools.
-RUN go install github.com/owasp-amass/amass/v4/...@latest && \
+RUN go install github.com/owasp-amass/amass/v4/cmd/amass@latest && \
     go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \
     go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest && \
     go install github.com/projectdiscovery/httpx/cmd/httpx@latest && \

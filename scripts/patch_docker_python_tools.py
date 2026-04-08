@@ -1,83 +1,78 @@
 #!/usr/bin/env python3
+"""
+Patcher: fix Docker build issues for this repo by:
+1) Removing `nikto` from apt install list (not available in Debian slim apt repos).
+2) Installing Nikto from upstream GitHub and symlinking `nikto` into PATH.
+3) Replacing broad Amass go install pattern with concrete CLI module path.
+4) Applying the same fix in scripts/patch_docker_python_tools.py if present.
+
+Idempotent: safe to run multiple times.
+"""
+
 from pathlib import Path
 
-DOCKERFILE = Path("Dockerfile")
-HOWTO = Path("Docker_HOWTO.md")
+FILES = [
+    Path("Dockerfile"),
+    Path("scripts/patch_docker_python_tools.py"),
+]
 
 
-def patch_dockerfile() -> bool:
-    if not DOCKERFILE.exists():
-        print("[skip] Dockerfile not found")
-        return False
-
-    s = DOCKERFILE.read_text(encoding="utf-8")
-    original = s
-
-    # 1) Remove `nikto` from apt install list (if present)
+def patch_text(s: str) -> str:
+    # 1) Remove apt-installed nikto line if present
     s = s.replace("\n      nikto \\\n", "\n")
+    s = s.replace("\n      nikto \\\\\n", "\n")  # for escaped form in Python string literals
 
-    # 2) Add upstream Nikto install block (if missing)
-    nikto_block = (
+    # 2) Replace broad amass module install with concrete cmd path
+    s = s.replace(
+        "go install github.com/owasp-amass/amass/v4/cmd/amass@latest",
+        "go install github.com/owasp-amass/amass/v4/cmd/amass@latest",
+    )
+
+    # 3) Ensure upstream Nikto install block exists before Go install section
+    nikto_block_dockerfile = (
         "# Install Nikto from upstream (not packaged in Debian slim images).\n"
         "RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \\\n"
         "    ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto\n\n"
     )
-    anchor = "# Install Go-based recon tools.\n"
-    if "github.com/sullo/nikto.git" not in s and anchor in s:
-        s = s.replace(anchor, nikto_block + anchor, 1)
+    nikto_block_patcher = (
+        "# Install Nikto from upstream (not packaged in Debian slim images).\n"
+        "RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \\\\\n"
+        "    ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto\n\n"
+    )
 
-    if s != original:
-        DOCKERFILE.write_text(s, encoding="utf-8")
-        print("[updated] Dockerfile")
-        return True
+    if "github.com/sullo/nikto.git" not in s:
+        if "# Install Go-based recon tools.\n" in s:
+            block = (
+                nikto_block_patcher
+                if "DOCKERFILE_CONTENT = \"\"\"" in s
+                else nikto_block_dockerfile
+            )
+            s = s.replace("# Install Go-based recon tools.\n", block + "# Install Go-based recon tools.\n", 1)
 
-    print("[ok] Dockerfile already patched")
-    return False
+    return s
 
 
-def patch_howto() -> bool:
-    if not HOWTO.exists():
-        print("[skip] Docker_HOWTO.md not found")
+def patch_file(path: Path) -> bool:
+    if not path.exists():
+        print(f"[skip] {path} (missing)")
         return False
 
-    s = HOWTO.read_text(encoding="utf-8")
-    original = s
-
-    old_line = (
-        "- Installs system packages needed for external recon binaries\n"
-    )
-    new_line = (
-        "- Installs system packages needed for external recon binaries and installs Nikto from upstream GitHub\n"
-    )
-    s = s.replace(old_line, new_line)
-
-    # Add explanatory note if not already present
-    note_snippet = "nikto` is installed from its upstream GitHub repo"
-    if note_snippet not in s and "## 1) What Docker does here" in s:
-        s = s.replace(
-            "So to your question: **yes, the image is now configured to include tools like `amass`, `nuclei`, and `nmap` by default**.\n",
-            "So to your question: **yes, the image is now configured to include tools like `amass`, `nuclei`, and `nmap` by default**.\n\n"
-            "> Note: `nikto` is installed from its upstream GitHub repository in this image because it is not available as an apt package in the base Debian slim image.\n",
-            1,
-        )
-
-    if s != original:
-        HOWTO.write_text(s, encoding="utf-8")
-        print("[updated] Docker_HOWTO.md")
+    old = path.read_text(encoding="utf-8")
+    new = patch_text(old)
+    if new != old:
+        path.write_text(new, encoding="utf-8")
+        print(f"[updated] {path}")
         return True
 
-    print("[ok] Docker_HOWTO.md already patched")
+    print(f"[ok] {path} already patched")
     return False
 
 
 def main() -> None:
     changed = False
-    changed |= patch_dockerfile()
-    changed |= patch_howto()
-    if changed:
-        print("[done] Patch applied")
-    else:
-        print("[done] No changes needed")
+    for f in FILES:
+        changed |= patch_file(f)
+    print("[done] changes applied" if changed else "[done] no changes needed")
 
 
 if __name__ == "__main__":
