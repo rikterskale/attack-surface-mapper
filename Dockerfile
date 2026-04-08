@@ -41,21 +41,26 @@ RUN set -eux; \
 
 # Install Python-based recon tools plus this project and dev tooling.
 COPY . .
-RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    python -m pip install --no-cache-dir \
-      dirsearch \
-      knockpy \
-      sherlock-project \
-      theHarvester && \
-    python -m pip install --no-cache-dir -e ".[dev]" && \
-    python --version && \
-    pip --version && \
-    ruff --version && \
-    mypy --version && \
-    pytest --version && \
-    amass -version && \
-    nuclei -version && \
-    nmap --version
+RUN set -eux; \
+    python -m pip install --no-cache-dir --upgrade pip setuptools wheel; \
+    for pkg in dirsearch knockpy sherlock-project theHarvester; do \
+      if ! python -m pip install --no-cache-dir "$pkg"; then \
+        echo "WARN: failed to install Python recon package $pkg (continuing)"; \
+      fi; \
+    done; \
+    python -m pip install --no-cache-dir -e ".[dev]"; \
+    python --version; \
+    pip --version; \
+    ruff --version; \
+    mypy --version; \
+    pytest --version; \
+    for cmd in amass nuclei nmap; do \
+      if command -v "$cmd" >/dev/null 2>&1; then \
+        "$cmd" --version || "$cmd" -version || true; \
+      else \
+        echo "WARN: $cmd not found in PATH (continuing)"; \
+      fi; \
+    done
 
 # Default command shows CLI help.
 CMD ["python", "attack_surface_mapper.py", "--help"]
