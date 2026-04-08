@@ -11,10 +11,7 @@ help: ## Show this help
 # Setup & install
 # ------------------------------------------------------------------
 
-setup: $(VENV)/bin/activate install-dev ## Full first-time setup (venv + deps + hooks + clean cached junk)
-	@# Remove any .pyc / __pycache__ that were accidentally committed
-	@git rm -r --cached __pycache__ tests/__pycache__ 2>/dev/null || true
-	@git rm --cached pyproject.zip 2>/dev/null || true
+setup: $(VENV)/bin/activate install-dev ## Full first-time setup (venv + deps + hooks)
 	@# Install pre-commit hook
 	@mkdir -p .git/hooks
 	@cp pre-commit-hook.sh .git/hooks/pre-commit
