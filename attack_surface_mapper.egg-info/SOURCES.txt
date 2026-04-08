@@ -1,0 +1,12 @@
+README.md
+attack_surface_mapper.py
+create_scope.py
+pyproject.toml
+scope_utils.py
+attack_surface_mapper.egg-info/PKG-INFO
+attack_surface_mapper.egg-info/SOURCES.txt
+attack_surface_mapper.egg-info/dependency_links.txt
+attack_surface_mapper.egg-info/entry_points.txt
+attack_surface_mapper.egg-info/requires.txt
+attack_surface_mapper.egg-info/top_level.txt
+tests/test_attack_surface_mapper.py

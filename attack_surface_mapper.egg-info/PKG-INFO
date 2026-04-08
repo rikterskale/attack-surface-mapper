@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: attack-surface-mapper
+Version: 3.4.0
+Summary: Signed-scope recon orchestrator
+Requires-Python: >=3.10
+Requires-Dist: structlog==25.4.0
+Requires-Dist: opentelemetry-api==1.40.0
+Requires-Dist: opentelemetry-sdk==1.40.0
+Requires-Dist: pydantic==2.11.3
+Requires-Dist: defusedxml==0.7.1
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: mypy>=1.11; extra == "dev"
+Requires-Dist: ruff>=0.6; extra == "dev"

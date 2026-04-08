@@ -25,6 +25,9 @@ dev = [
   "ruff>=0.6",
 ]
 
+[tool.setuptools]
+py-modules = ["attack_surface_mapper", "create_scope", "scope_utils"]
+
 # ------------------------------------------------------------------
 # Tool configuration
 # ------------------------------------------------------------------

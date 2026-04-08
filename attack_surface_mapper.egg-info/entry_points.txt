@@ -1,0 +1,2 @@
+[console_scripts]
+attack-surface-mapper = attack_surface_mapper:cli
