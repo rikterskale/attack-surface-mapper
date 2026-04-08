@@ -1,55 +1,59 @@
 #!/usr/bin/env python3
 """
-Patcher: fix Docker build issues for this repo by:
-1) Removing `nikto` from apt install list (not available in Debian slim apt repos).
-2) Installing Nikto from upstream GitHub and symlinking `nikto` into PATH.
-3) Replacing broad Amass go install pattern with concrete CLI module path.
-4) Applying the same fix in scripts/patch_docker_python_tools.py if present.
+Patcher for Docker Go-install build failures.
 
-Idempotent: safe to run multiple times.
+What it changes:
+1) Rewrites the Go tool install RUN block in Dockerfile to "best effort"
+   so a single upstream/toolchain break does not fail the whole image build.
+2) Applies the same change inside scripts/patch_docker_python_tools.py so
+   future generated Dockerfiles keep the fix.
+
+Usage:
+  python patch_go_install_failures.py
 """
 
 from pathlib import Path
 
-FILES = [
+TARGETS = [
     Path("Dockerfile"),
     Path("scripts/patch_docker_python_tools.py"),
 ]
 
+OLD_BLOCK_DOCKERFILE = """# Install Go-based recon tools (best effort; do not fail entire image build).
+RUN set -eux; \\
+    for pkg in \\
+      github.com/owasp-amass/amass/v4/cmd/amass@latest \\
+      github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest \\
+      github.com/projectdiscovery/naabu/v2/cmd/naabu@latest \\
+      github.com/projectdiscovery/httpx/cmd/httpx@latest \\
+      github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest \\
+      github.com/tomnomnom/assetfinder@latest \\
+      github.com/tomnomnom/httprobe@latest; do \\
+        if ! go install "$pkg"; then \\
+          echo "WARN: failed to install $pkg (continuing)"; \\
+        fi; \\
+    done
+"""
 
-def patch_text(s: str) -> str:
-    # 1) Remove apt-installed nikto line if present
-    s = s.replace("\n      nikto \\\n", "\n")
-    s = s.replace("\n      nikto \\\\\n", "\n")  # for escaped form in Python string literals
+NEW_BLOCK_DOCKERFILE = """# Install Go-based recon tools (best effort; do not fail entire image build).
+RUN set -eux; \\
+    for pkg in \\
+      github.com/owasp-amass/amass/v4/cmd/amass@latest \\
+      github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest \\
+      github.com/projectdiscovery/naabu/v2/cmd/naabu@latest \\
+      github.com/projectdiscovery/httpx/cmd/httpx@latest \\
+      github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest \\
+      github.com/tomnomnom/assetfinder@latest \\
+      github.com/tomnomnom/httprobe@latest; do \\
+        if ! go install "$pkg"; then \\
+          echo "WARN: failed to install $pkg (continuing)"; \\
+        fi; \\
+    done
+"""
 
-    # 2) Replace broad amass module install with concrete cmd path
-    s = s.replace(
-        "go install github.com/owasp-amass/amass/v4/cmd/amass@latest",
-        "go install github.com/owasp-amass/amass/v4/cmd/amass@latest",
-    )
-
-    # 3) Ensure upstream Nikto install block exists before Go install section
-    nikto_block_dockerfile = (
-        "# Install Nikto from upstream (not packaged in Debian slim images).\n"
-        "RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \\\n"
-        "    ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto\n\n"
-    )
-    nikto_block_patcher = (
-        "# Install Nikto from upstream (not packaged in Debian slim images).\n"
-        "RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \\\\\n"
-        "    ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto\n\n"
-    )
-
-    if "github.com/sullo/nikto.git" not in s:
-        if "# Install Go-based recon tools.\n" in s:
-            block = (
-                nikto_block_patcher
-                if "DOCKERFILE_CONTENT = \"\"\"" in s
-                else nikto_block_dockerfile
-            )
-            s = s.replace("# Install Go-based recon tools.\n", block + "# Install Go-based recon tools.\n", 1)
-
-    return s
+# Same strings but escaped as they'd appear in the Python patcher's DOCKERFILE_CONTENT literal.
+OLD_BLOCK_PATCHER = OLD_BLOCK_DOCKERFILE.replace("\\", "\\\\")
+NEW_BLOCK_PATCHER = NEW_BLOCK_DOCKERFILE.replace("\\", "\\\\")
 
 
 def patch_file(path: Path) -> bool:
@@ -57,10 +61,34 @@ def patch_file(path: Path) -> bool:
         print(f"[skip] {path} (missing)")
         return False
 
-    old = path.read_text(encoding="utf-8")
-    new = patch_text(old)
-    if new != old:
-        path.write_text(new, encoding="utf-8")
+    text = path.read_text(encoding="utf-8")
+    original = text
+
+    # First try exact replacement for Dockerfile form.
+    text = text.replace(OLD_BLOCK_DOCKERFILE, NEW_BLOCK_DOCKERFILE)
+
+    # Then replace inside Python patcher template form.
+    text = text.replace(OLD_BLOCK_PATCHER, NEW_BLOCK_PATCHER)
+
+    # Fallback: if amass line exists but block differs slightly, inject best-effort wrapper.
+    if (
+        "go install github.com/owasp-amass/amass/v4/cmd/amass@latest" in text
+        and "best effort; do not fail entire image build" not in text
+    ):
+        # naive but safe fallback for minor formatting drifts
+        start = text.find("# Install Go-based recon tools.")
+        if start != -1:
+            end = text.find("\n\n# Install Python-based recon tools", start)
+            if end != -1:
+                replacement = (
+                    NEW_BLOCK_DOCKERFILE
+                    if path.name == "Dockerfile"
+                    else NEW_BLOCK_PATCHER
+                )
+                text = text[:start] + replacement + text[end:]
+
+    if text != original:
+        path.write_text(text, encoding="utf-8")
         print(f"[updated] {path}")
         return True
 
@@ -70,9 +98,9 @@ def patch_file(path: Path) -> bool:
 
 def main() -> None:
     changed = False
-    for f in FILES:
-        changed |= patch_file(f)
-    print("[done] changes applied" if changed else "[done] no changes needed")
+    for path in TARGETS:
+        changed |= patch_file(path)
+    print("[done] patch applied" if changed else "[done] no changes needed")
 
 
 if __name__ == "__main__":

@@ -24,14 +24,20 @@ RUN apt-get update && \
 RUN git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto && \
     ln -sf /opt/nikto/program/nikto.pl /usr/local/bin/nikto
 
-# Install Go-based recon tools.
-RUN go install github.com/owasp-amass/amass/v4/cmd/amass@latest && \
-    go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest && \
-    go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest && \
-    go install github.com/projectdiscovery/httpx/cmd/httpx@latest && \
-    go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest && \
-    go install github.com/tomnomnom/assetfinder@latest && \
-    go install github.com/tomnomnom/httprobe@latest
+# Install Go-based recon tools (best effort; do not fail entire image build).
+RUN set -eux; \
+    for pkg in \
+      github.com/owasp-amass/amass/v4/cmd/amass@latest \
+      github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest \
+      github.com/projectdiscovery/naabu/v2/cmd/naabu@latest \
+      github.com/projectdiscovery/httpx/cmd/httpx@latest \
+      github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest \
+      github.com/tomnomnom/assetfinder@latest \
+      github.com/tomnomnom/httprobe@latest; do \
+        if ! go install "$pkg"; then \
+          echo "WARN: failed to install $pkg (continuing)"; \
+        fi; \
+    done
 
 # Install Python-based recon tools plus this project and dev tooling.
 COPY . .
